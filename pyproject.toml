@@ -24,8 +24,14 @@ classifiers = [
 requires-python = ">=3.8"
 dependencies = [
     "pywssocks>=0.1.0",
-    "requests>=2.25.0",
-    "httpx>=0.23.0",
+    "curl_cffi>=0.7.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-timeout>=2.0.0",
 ]
 
 [project.urls]
