@@ -1,6 +1,5 @@
 import logging
 import time
-import secrets
 import threading
 import asyncio
 from typing import Optional, Dict, Any
@@ -11,6 +10,20 @@ from pywssocks import WSSocksClient
 
 
 logger = logging.getLogger(__name__)
+
+
+def _raise_for_status(resp):
+    """Raise exception with detailed error message from API response."""
+    if resp.status_code >= 400:
+        error_detail = f"HTTP {resp.status_code}"
+        try:
+            data = resp.json()
+            if isinstance(data, dict):
+                error_detail = data.get("error") or data.get("detail") or data.get("message") or error_detail
+        except:
+            if resp.text:
+                error_detail = resp.text[:200]
+        raise RuntimeError(f"API request failed: {error_detail}")
 
 
 class CloudflareSolver:
@@ -56,9 +69,6 @@ class CloudflareSolver:
         self.api_proxy = api_proxy
         self.impersonate = impersonate
         
-        # Connector token: auto-generated, not exposed to user
-        self.connector_token = secrets.token_urlsafe(16)
-        
         self._client: Optional[WSSocksClient] = None
         self._client_thread: Optional[threading.Thread] = None
         self._session = Session(
@@ -71,7 +81,7 @@ class CloudflareSolver:
     def _get_linksocks_config(self) -> Dict[str, Any]:
         url = f"{self.api_base}/api/linksocks/getLinkSocks"
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-        with Session(verify=False, proxy=self.api_proxy, impersonate=self.impersonate) as s:
+        with Session(verify=False, proxy=self.api_proxy) as s:
             resp = s.post(url, headers=headers)
             if resp.status_code != 200:
                 error_detail = f"HTTP {resp.status_code}"
@@ -95,10 +105,11 @@ class CloudflareSolver:
                 async def _start():
                     self._client = WSSocksClient(
                         ws_url=self._linksocks_config["url"],
-                        token=self.connector_token,
-                        reverse=True
+                        token=self._linksocks_config["token"],
+                        reverse=True,
                     )
-                    await self._client.start()
+                    task = await self._client.wait_ready(timeout=10)
+                    await task
                 
                 try:
                     asyncio.run(_start())
@@ -108,7 +119,7 @@ class CloudflareSolver:
             self._client_thread = threading.Thread(target=run_client, daemon=True)
             self._client_thread.start()
             
-            time.sleep(1) # Wait for connection
+            time.sleep(2)
             logger.info("LinkSocks Provider established (background thread)")
             
         except Exception as e:
@@ -126,8 +137,8 @@ class CloudflareSolver:
         return any(k in text for k in ["cf-turnstile", "cf-challenge", "Just a moment"])
     
     def _solve_challenge(self, url: str, html: Optional[str] = None):
-        if not self._client_thread or not self._client_thread.is_alive():
-            self._connect()
+        # Lazy connect: only connect to linksocks when actually solving a challenge
+        self._connect()
         
         if not self._linksocks_config:
             error_detail = getattr(self, '_last_connect_error', 'connection failed')
@@ -135,7 +146,7 @@ class CloudflareSolver:
         
         logger.info(f"Starting challenge solve: {url}")
         
-        with Session(verify=False, proxy=self.api_proxy, impersonate=self.impersonate) as api_session:
+        with Session(verify=False, proxy=self.api_proxy) as api_session:
             resp = api_session.post(
                 f"{self.api_base}/api/createTask",
                 json={
@@ -145,12 +156,12 @@ class CloudflareSolver:
                         "websiteURL": url,
                         "linksocks": {
                             "url": self._linksocks_config["url"],
-                            "token": self.connector_token,
+                            "token": self._linksocks_config["connector_token"],
                         },
                     },
                 },
             )
-            resp.raise_for_status()
+            _raise_for_status(resp)
             data = resp.json()
         
         if data.get("errorId"):
@@ -160,7 +171,7 @@ class CloudflareSolver:
         logger.debug(f"Task created: {task_id}")
         
         start = time.time()
-        with Session(verify=False, proxy=self.api_proxy, impersonate=self.impersonate) as poll_session:
+        with Session(verify=False, proxy=self.api_proxy) as poll_session:
             while time.time() - start < 120:
                 res = poll_session.post(
                     f"{self.api_base}/api/getTaskResult",
@@ -183,7 +194,12 @@ class CloudflareSolver:
                     success = (status in ("completed", "ready")) and (result.get("error") in (None, ""))
 
                 if not success:
-                    error = result.get("error") or "Unknown error"
+                    worker_result = result.get("result") or {}
+                    error = (
+                        result.get("error") 
+                        or worker_result.get("error") 
+                        or f"Unknown error (full response: {result})"
+                    )
                     raise RuntimeError(f"Challenge solve failed: {error}")
 
                 worker_result = result.get("result") or {}
@@ -227,16 +243,9 @@ class CloudflareSolver:
             RuntimeError: If task creation or solving fails
             TimeoutError: If solving takes too long
         """
-        if not self._client_thread or not self._client_thread.is_alive():
-            self._connect()
-        
-        if not self._linksocks_config:
-            error_detail = getattr(self, '_last_connect_error', 'connection failed')
-            raise RuntimeError(f"CloudFlyer service unavailable: {error_detail}")
-        
         logger.info(f"Starting Turnstile solve: {url}")
         
-        with Session(verify=False, proxy=self.api_proxy, impersonate=self.impersonate) as api_session:
+        with Session(verify=False, proxy=self.api_proxy) as api_session:
             resp = api_session.post(
                 f"{self.api_base}/api/createTask",
                 json={
@@ -245,14 +254,10 @@ class CloudflareSolver:
                         "type": "TurnstileTask",
                         "websiteURL": url,
                         "websiteKey": sitekey,
-                        "linksocks": {
-                            "url": self._linksocks_config["url"],
-                            "token": self.connector_token,
-                        },
                     },
                 },
             )
-            resp.raise_for_status()
+            _raise_for_status(resp)
             data = resp.json()
         
         if data.get("errorId"):
@@ -262,7 +267,7 @@ class CloudflareSolver:
         logger.debug(f"Turnstile task created: {task_id}")
         
         start = time.time()
-        with Session(verify=False, proxy=self.api_proxy, impersonate=self.impersonate) as poll_session:
+        with Session(verify=False, proxy=self.api_proxy) as poll_session:
             while time.time() - start < 120:
                 res = poll_session.post(
                     f"{self.api_base}/api/getTaskResult",
@@ -285,7 +290,12 @@ class CloudflareSolver:
                     success = (status in ("completed", "ready")) and (result.get("error") in (None, ""))
                 
                 if not success:
-                    error = result.get("error") or "Unknown error"
+                    worker_result = result.get("result") or {}
+                    error = (
+                        result.get("error") 
+                        or worker_result.get("error") 
+                        or f"Unknown error (full response: {result})"
+                    )
                     raise RuntimeError(f"Turnstile solve failed: {error}")
                 
                 worker_result = result.get("result") or {}
@@ -350,8 +360,8 @@ class CloudflareSolver:
         logger.info("Session closed")
     
     def __enter__(self):
-        if self.solve:
-            self._connect()
+        # Don't connect to linksocks eagerly - it will be connected lazily
+        # when _solve_challenge is called (for CloudflareTask only)
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):

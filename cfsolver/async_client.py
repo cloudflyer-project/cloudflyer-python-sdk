@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import secrets
 import time
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse
@@ -9,6 +8,20 @@ from curl_cffi.requests import AsyncSession, Response
 from pywssocks import WSSocksClient
 
 logger = logging.getLogger(__name__)
+
+
+def _raise_for_status(resp):
+    """Raise exception with detailed error message from API response."""
+    if resp.status_code >= 400:
+        error_detail = f"HTTP {resp.status_code}"
+        try:
+            data = resp.json()
+            if isinstance(data, dict):
+                error_detail = data.get("error") or data.get("detail") or data.get("message") or error_detail
+        except:
+            if resp.text:
+                error_detail = resp.text[:200]
+        raise RuntimeError(f"API request failed: {error_detail}")
 
 
 class AsyncCloudflareSolver:
@@ -51,9 +64,6 @@ class AsyncCloudflareSolver:
         self.api_proxy = api_proxy
         self.impersonate = impersonate
         
-        # Connector token: auto-generated, not exposed to user
-        self.connector_token = secrets.token_urlsafe(16)
-        
         self._client: Optional[WSSocksClient] = None
         self._client_task: Optional[asyncio.Task] = None
         self._linksocks_config: Optional[Dict[str, Any]] = None
@@ -64,11 +74,10 @@ class AsyncCloudflareSolver:
             impersonate=self.impersonate,
         )
         
-        # API client uses api_proxy
+        # API client uses api_proxy, no impersonate (not needed for API calls)
         self._api_client = AsyncSession(
             verify=False,
             proxy=self.api_proxy,
-            impersonate=self.impersonate,
         )
 
     async def _get_linksocks_config(self) -> Dict[str, Any]:
@@ -93,11 +102,10 @@ class AsyncCloudflareSolver:
             self._linksocks_config = await self._get_linksocks_config()
             self._client = WSSocksClient(
                 ws_url=self._linksocks_config["url"],
-                token=self.connector_token,
+                token=self._linksocks_config["token"],
                 reverse=True
             )
-            self._client_task = asyncio.create_task(self._client.start())
-            await asyncio.sleep(1)
+            self._client_task = await self._client.wait_ready(timeout=10)
             logger.info("LinkSocks Provider established")
         except Exception as e:
             logger.error(f"Connection setup failed: {e}")
@@ -114,8 +122,8 @@ class AsyncCloudflareSolver:
         return any(k in text for k in ["cf-turnstile", "cf-challenge", "Just a moment"])
 
     async def _solve_challenge(self, url: str, html: Optional[str] = None):
-        if not self._client_task or self._client_task.done():
-            await self._connect()
+        # Lazy connect: only connect to linksocks when actually solving a challenge
+        await self._connect()
         
         if not self._linksocks_config:
             error_detail = getattr(self, '_last_connect_error', 'connection failed')
@@ -132,12 +140,12 @@ class AsyncCloudflareSolver:
                     "websiteURL": url,
                     "linksocks": {
                         "url": self._linksocks_config["url"],
-                        "token": self.connector_token,
+                        "token": self._linksocks_config["connector_token"],
                     },
                 },
             },
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         data = resp.json()
         
         if data.get("errorId"):
@@ -171,7 +179,12 @@ class AsyncCloudflareSolver:
                 success = (status in ("completed", "ready")) and (result.get("error") in (None, ""))
 
             if not success:
-                error = result.get("error") or "Unknown error"
+                worker_result = result.get("result") or {}
+                error = (
+                    result.get("error") 
+                    or worker_result.get("error") 
+                    or f"Unknown error (full response: {result})"
+                )
                 raise RuntimeError(f"Challenge solve failed: {error}")
 
             # Extract normalized solution from worker result structure
@@ -216,13 +229,6 @@ class AsyncCloudflareSolver:
             RuntimeError: If task creation or solving fails
             TimeoutError: If solving takes too long
         """
-        if not self._client_task or self._client_task.done():
-            await self._connect()
-        
-        if not self._linksocks_config:
-            error_detail = getattr(self, '_last_connect_error', 'connection failed')
-            raise RuntimeError(f"CloudFlyer service unavailable: {error_detail}")
-        
         logger.info(f"Starting Turnstile solve: {url}")
         
         resp = await self._api_client.post(
@@ -233,14 +239,10 @@ class AsyncCloudflareSolver:
                     "type": "TurnstileTask",
                     "websiteURL": url,
                     "websiteKey": sitekey,
-                    "linksocks": {
-                        "url": self._linksocks_config["url"],
-                        "token": self.connector_token,
-                    },
                 },
             },
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         data = resp.json()
         
         if data.get("errorId"):
@@ -347,8 +349,8 @@ class AsyncCloudflareSolver:
         logger.info("Async session closed")
     
     async def __aenter__(self):
-        if self.solve:
-            await self._connect()
+        # Don't connect to linksocks eagerly - it will be connected lazily
+        # when _solve_challenge is called (for CloudflareTask only)
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
