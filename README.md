@@ -85,7 +85,7 @@ with CloudflareSolver("your-api-key") as solver:
 ## Parameters
 
 - `api_key`: Your API key (required)
-- `api_base`: CloudFlyer service URL (default: `https://cloudflyer.zetx.tech`)
+- `api_base`: CloudFlyer service URL (default: `https://solver.zetx.site`)
 - `solve`: Enable challenge solving (default `True`, set to `False` to disable completely)
 - `on_challenge`: Solve only on challenge detection (default `True`), or always pre-solve (`False`)
 - `proxy`: Proxy for outgoing HTTP requests (optional)

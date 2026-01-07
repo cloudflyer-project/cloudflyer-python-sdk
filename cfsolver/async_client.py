@@ -80,6 +80,15 @@ class AsyncCloudflareSolver:
             proxy=self.api_proxy,
         )
 
+    @staticmethod
+    def _normalize_ws_url(url: str) -> str:
+        """Convert http(s) URL to ws(s) URL if needed."""
+        if url.startswith("https://"):
+            return "wss://" + url[8:]
+        elif url.startswith("http://"):
+            return "ws://" + url[7:]
+        return url
+
     async def _get_linksocks_config(self) -> Dict[str, Any]:
         url = f"{self.api_base}/api/linksocks/getLinkSocks"
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
@@ -93,7 +102,10 @@ class AsyncCloudflareSolver:
             except:
                 error_detail = resp.text or error_detail
             raise RuntimeError(f"Failed to get linksocks config: {error_detail}")
-        return resp.json()
+        config = resp.json()
+        if "url" in config:
+            config["url"] = self._normalize_ws_url(config["url"])
+        return config
     
     async def _connect(self):
         if self._client_task and not self._client_task.done():

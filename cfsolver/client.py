@@ -78,6 +78,15 @@ class CloudflareSolver:
         )
         self._linksocks_config: Optional[Dict[str, Any]] = None
     
+    @staticmethod
+    def _normalize_ws_url(url: str) -> str:
+        """Convert http(s) URL to ws(s) URL if needed."""
+        if url.startswith("https://"):
+            return "wss://" + url[8:]
+        elif url.startswith("http://"):
+            return "ws://" + url[7:]
+        return url
+
     def _get_linksocks_config(self) -> Dict[str, Any]:
         url = f"{self.api_base}/api/linksocks/getLinkSocks"
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
@@ -92,7 +101,10 @@ class CloudflareSolver:
                 except:
                     error_detail = resp.text or error_detail
                 raise RuntimeError(f"Failed to get linksocks config: {error_detail}")
-            return resp.json()
+            config = resp.json()
+            if "url" in config:
+                config["url"] = self._normalize_ws_url(config["url"])
+            return config
     
     def _connect(self):
         if self._client_thread and self._client_thread.is_alive():
