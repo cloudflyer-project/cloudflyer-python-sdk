@@ -5,12 +5,12 @@ from cfsolver import CloudflareSolver, AsyncCloudflareSolver
 
 TEST_TARGETS = {
     "cloudflare": {
-        "url": "https://2captcha.com/demo/cloudflare-turnstile-challenge",
+        "url": "https://cloudflyer.zetx.site/demo/challenge",
         "type": "CloudflareChallenge",
     },
     "turnstile": {
-        "url": "https://www.coronausa.com",
-        "siteKey": "0x4AAAAAAAH4-VmiV_O_wBN-",
+        "url": "https://cloudflyer.zetx.site/demo/turnstile",
+        "siteKey": "0x4AAAAAACJkAlPHW8xr1T2J",
         "type": "Turnstile",
     },
 }

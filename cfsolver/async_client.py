@@ -33,7 +33,7 @@ class AsyncCloudflareSolver:
     
     Args:
         api_key: Your API key
-        api_base: CloudFlyer service URL (default: https://cloudflyer.zetx.tech)
+        api_base: CloudFlyer service URL (default: https://solver.zetx.site)
         solve: Enable automatic challenge solving (default: True)
         on_challenge: Solve only when challenge detected (default: True)
         proxy: HTTP proxy for your requests (optional)
@@ -49,7 +49,7 @@ class AsyncCloudflareSolver:
     def __init__(
         self,
         api_key: str,
-        api_base: str = "https://cloudflyer.zetx.tech",
+        api_base: str = "https://solver.zetx.site",
         solve: bool = True,
         on_challenge: bool = True,
         proxy: Optional[str] = None,
