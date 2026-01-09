@@ -101,7 +101,11 @@ class CloudflareSolver:
                 except:
                     error_detail = resp.text or error_detail
                 raise RuntimeError(f"Failed to get linksocks config: {error_detail}")
-            config = resp.json()
+            try:
+                config = resp.json()
+            except Exception as e:
+                preview = resp.text[:200] if resp.text else "(empty)"
+                raise RuntimeError(f"Failed to parse linksocks config from {url}: {e}, response preview: {preview}")
             if "url" in config:
                 config["url"] = self._normalize_ws_url(config["url"])
             return config
