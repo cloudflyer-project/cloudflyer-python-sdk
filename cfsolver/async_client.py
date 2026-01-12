@@ -1,3 +1,28 @@
+"""
+CFSolver - Asynchronous HTTP client with automatic Cloudflare challenge bypass.
+
+This module provides an async drop-in replacement for httpx/aiohttp that automatically
+detects and solves Cloudflare challenges using the CloudFlyer cloud API.
+
+Features:
+    - Automatic challenge detection and solving
+    - Browser TLS fingerprint impersonation via curl-impersonate
+    - LinkSocks tunnel support for challenge solving
+    - Configurable polling strategy (long-polling vs interval polling)
+    - Full async/await support
+
+Example:
+    >>> import asyncio
+    >>> from cfsolver import AsyncCloudflareSolver
+    >>> async def main():
+    ...     async with AsyncCloudflareSolver("your-api-key") as solver:
+    ...         response = await solver.get("https://protected-site.com")
+    ...         print(response.text)
+    >>> asyncio.run(main())
+
+Copyright (c) 2024 CloudFlyer Team. MIT License.
+"""
+
 import asyncio
 import logging
 import time
@@ -39,6 +64,9 @@ class AsyncCloudflareSolver:
         proxy: HTTP proxy for your requests (optional)
         api_proxy: Proxy for service API calls (optional)
         impersonate: Browser to impersonate (default: "chrome")
+        use_polling: Use interval polling instead of long-polling (default: False).
+            When False, uses /waitTaskResult for efficient long-polling.
+            When True, uses /getTaskResult with 2-second intervals.
     
     Examples:
         >>> async with AsyncCloudflareSolver("your_api_key") as solver:
@@ -55,9 +83,16 @@ class AsyncCloudflareSolver:
         proxy: Optional[str] = None,
         api_proxy: Optional[str] = None,
         impersonate: str = "chrome",
+        use_polling: bool = False,
     ):
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
+        self.solve = solve
+        self.on_challenge = on_challenge
+        self.user_proxy = proxy
+        self.api_proxy = api_proxy
+        self.impersonate = impersonate
+        self.use_polling = use_polling
         self.solve = solve
         self.on_challenge = on_challenge
         self.user_proxy = proxy
@@ -166,65 +201,99 @@ class AsyncCloudflareSolver:
         task_id = data["taskId"]
         logger.debug(f"Task created: {task_id}")
         
+        result = await self._wait_for_result(task_id)
+        
+        # Extract normalized solution from worker result structure
+        worker_result = result.get("result") or {}
+        if isinstance(worker_result.get("result"), dict):
+            solution = worker_result["result"]
+        else:
+            solution = worker_result
+
+        if not isinstance(solution, dict):
+            raise RuntimeError("Challenge solve failed: invalid response from server")
+
+        cookies = solution.get("cookies", {})
+        user_agent = solution.get("userAgent")
+        headers = solution.get("headers")
+        if not user_agent and isinstance(headers, dict):
+            user_agent = headers.get("User-Agent")
+
+        domain = urlparse(url).hostname
+        for k, v in cookies.items():
+            self._session.cookies.set(k, v, domain=domain)
+
+        if user_agent:
+            self._session.headers["User-Agent"] = user_agent
+
+        logger.info("Challenge solved successfully")
+    
+    async def _wait_for_result(self, task_id: str, timeout: int = 120) -> Dict[str, Any]:
+        """
+        Wait for task result using either long-polling or interval polling.
+        
+        Args:
+            task_id: The task ID to wait for
+            timeout: Maximum time to wait in seconds
+        
+        Returns:
+            The task result dictionary
+        
+        Raises:
+            RuntimeError: If task fails
+            TimeoutError: If timeout is reached
+        """
         start = time.time()
-        while time.time() - start < 120:
+        
+        while time.time() - start < timeout:
+            # Choose endpoint based on polling strategy
+            if self.use_polling:
+                endpoint = f"{self.api_base}/api/getTaskResult"
+            else:
+                endpoint = f"{self.api_base}/api/waitTaskResult"
+            
             res = await self._api_client.post(
-                f"{self.api_base}/api/getTaskResult",
+                endpoint,
                 json={"apiKey": self.api_key, "taskId": task_id},
             )
+            
             if res.status_code != 200:
-                await asyncio.sleep(2)
+                if self.use_polling:
+                    await asyncio.sleep(2)
                 continue
-                
+            
             result = res.json()
             status = result.get("status")
-            # API layer still processing
+            
+            # Still processing - wait and retry
             if status == "processing":
-                await asyncio.sleep(2)
+                if self.use_polling:
+                    await asyncio.sleep(2)
                 continue
-
-            # Determine success based on worker result
+            
+            # Check for timeout status from waitTaskResult
+            if status == "timeout":
+                continue  # Retry the long-poll
+            
+            # Determine success
             success_field = result.get("success")
             if isinstance(success_field, bool):
                 success = success_field
             else:
                 success = (status in ("completed", "ready")) and (result.get("error") in (None, ""))
-
+            
             if not success:
                 worker_result = result.get("result") or {}
                 error = (
-                    result.get("error") 
-                    or worker_result.get("error") 
+                    result.get("error")
+                    or worker_result.get("error")
                     or f"Unknown error (full response: {result})"
                 )
-                raise RuntimeError(f"Challenge solve failed: {error}")
-
-            # Extract normalized solution from worker result structure
-            worker_result = result.get("result") or {}
-            if isinstance(worker_result.get("result"), dict):
-                solution = worker_result["result"]
-            else:
-                solution = worker_result
-
-            if not isinstance(solution, dict):
-                raise RuntimeError("Challenge solve failed: invalid response from server")
-
-            cookies = solution.get("cookies", {})
-            user_agent = solution.get("userAgent")
-            headers = solution.get("headers")
-            if not user_agent and isinstance(headers, dict):
-                user_agent = headers.get("User-Agent")
-
-            domain = urlparse(url).hostname
-            for k, v in cookies.items():
-                self._session.cookies.set(k, v, domain=domain)
-
-            if user_agent:
-                self._session.headers["User-Agent"] = user_agent
-
-            logger.info("Challenge solved successfully")
-            return
-        raise TimeoutError("Challenge solve timed out")
+                raise RuntimeError(f"Task failed: {error}")
+            
+            return result
+        
+        raise TimeoutError("Task timed out")
     
     async def solve_turnstile(self, url: str, sitekey: str) -> str:
         """
@@ -263,46 +332,25 @@ class AsyncCloudflareSolver:
         task_id = data["taskId"]
         logger.debug(f"Turnstile task created: {task_id}")
         
-        start = time.time()
-        while time.time() - start < 120:
-            res = await self._api_client.post(
-                f"{self.api_base}/api/getTaskResult",
-                json={"apiKey": self.api_key, "taskId": task_id},
-            )
-            if res.status_code != 200:
-                await asyncio.sleep(2)
-                continue
-            
-            result = res.json()
-            status = result.get("status")
-            if status == "processing":
-                await asyncio.sleep(2)
-                continue
-            
-            success_field = result.get("success")
-            if isinstance(success_field, bool):
-                success = success_field
-            else:
-                success = (status in ("completed", "ready")) and (result.get("error") in (None, ""))
-            
-            if not success:
-                error = result.get("error") or "Unknown error"
-                raise RuntimeError(f"Turnstile solve failed: {error}")
-            
-            worker_result = result.get("result") or {}
-            if isinstance(worker_result.get("result"), dict):
-                solution = worker_result["result"]
-            else:
-                solution = worker_result
-            
-            token = solution.get("token")
-            if not token:
-                raise RuntimeError("Turnstile solve failed: no token returned")
-            
-            logger.info("Turnstile solved successfully")
-            return token
+        try:
+            result = await self._wait_for_result(task_id)
+        except RuntimeError as e:
+            raise RuntimeError(f"Turnstile solve failed: {e}")
+        except TimeoutError:
+            raise TimeoutError("Turnstile solve timed out")
         
-        raise TimeoutError("Turnstile solve timed out")
+        worker_result = result.get("result") or {}
+        if isinstance(worker_result.get("result"), dict):
+            solution = worker_result["result"]
+        else:
+            solution = worker_result
+        
+        token = solution.get("token")
+        if not token:
+            raise RuntimeError("Turnstile solve failed: no token returned")
+        
+        logger.info("Turnstile solved successfully")
+        return token
 
     async def request(self, method: str, url: str, **kwargs) -> Response:
         if not self.solve:
