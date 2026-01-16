@@ -264,6 +264,7 @@ class CloudAPIProxyAddon:
             host = flow.request.host
             is_solver = False
 
+            # In no_cache mode, every request solves independently (no host-level serialization)
             if self.no_cache:
                 is_solver = True
             else:
@@ -281,12 +282,20 @@ class CloudAPIProxyAddon:
                     if event:
                         await loop.run_in_executor(None, event.wait, 120.0)
                     
-                    if flow.request.headers.get("X-Refetched-By-Waiter") == "1":
-                        return
-                    flow.request.headers["X-Refetched-By-Waiter"] = "1"
-                    ctx.master.commands.call("replay.client", [flow])
+                    # After waiting, get stored cf_clearance and re-fetch
+                    stored = self.get_cf_clearance_for_host(host)
+                    if stored:
+                        stored_ua, stored_cf = stored
+                        # Re-fetch the URL with the solved cookies
+                        refetch_result = await loop.run_in_executor(
+                            None, self._refetch_with_cookies, url, stored_cf, stored_ua, flow
+                        )
+                        if refetch_result:
+                            flow.response = refetch_result
+                            logger.debug(f"Waiter re-fetched {url} with stored cf_clearance")
                     return
 
+                # This is the solver thread
                 logger.info(f"Detected Cloudflare challenge for {url}, solving via cloud API...")
 
                 # Solve challenge using cloud API
@@ -558,18 +567,27 @@ class CloudAPIProxyAddon:
             inner = self.cf_clearance_store.get(key_host)
             if not inner:
                 return None
-            for data in inner.values():
-                if data and data.get("cf_clearance"):
-                    return data
+            for ua, cf in inner.items():
+                if ua and cf:
+                    return ua, cf
             return None
 
-    def clear_cf_clearance(self, host: Optional[str] = None) -> None:
+    def clear_cf_clearance(self, host: Optional[str] = None, user_agent: Optional[str] = None) -> None:
         """Clear stored cf_clearance entries."""
         with self._store_lock:
-            if host is None:
+            if host is None and user_agent is None:
                 self.cf_clearance_store.clear()
-            else:
-                self.cf_clearance_store.pop(host.lower(), None)
+                return
+            if host is not None:
+                key_host = host.lower()
+                if key_host in self.cf_clearance_store:
+                    if user_agent is None:
+                        self.cf_clearance_store.pop(key_host, None)
+                    else:
+                        inner = self.cf_clearance_store.get(key_host, {})
+                        inner.pop(user_agent, None)
+                        if not inner:
+                            self.cf_clearance_store.pop(key_host, None)
 
 
 class CloudAPITransparentProxy:
@@ -804,6 +822,8 @@ class CloudAPITransparentProxy:
     def stop(self):
         """Stop the transparent proxy server."""
         logger.info("Stopping transparent proxy")
+        
+        self._running = False
 
         try:
             if self._master:
@@ -811,10 +831,38 @@ class CloudAPITransparentProxy:
         except Exception:
             pass
 
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=3)
+        # Stop the event loop to unblock the thread
+        if self._loop and self._loop.is_running():
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except Exception:
+                pass
 
-        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+            
+            # Force cleanup if thread didn't exit gracefully
+            if self._thread.is_alive():
+                logger.warning("Proxy thread did not exit gracefully, forcing cleanup")
+                try:
+                    if self._loop and not self._loop.is_closed():
+                        self._loop.call_soon_threadsafe(self._loop.stop)
+                except Exception:
+                    pass
+
+        # Close the loop if it's still open
+        if self._loop and not self._loop.is_closed():
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+        
+        # Stop pproxy bridge if running
+        self._stop_pproxy_bridge()
+
+        self._loop = None
+        self._master = None
+        self._effective_upstream = None
         logger.info("Transparent proxy stopped")
 
     def __enter__(self):
@@ -829,13 +877,13 @@ class CloudAPITransparentProxy:
         """Store cf_clearance for a host."""
         self.addon.set_cf_clearance(host, user_agent, cf_clearance)
 
-    def get_cf_clearance(self, host: str, user_agent: str) -> Optional[Dict[str, str]]:
+    def get_cf_clearance(self, host: str, user_agent: str) -> Optional[str]:
         """Get stored cf_clearance for a host."""
         return self.addon.get_cf_clearance(host, user_agent)
 
-    def clear_cf_clearance(self, host: Optional[str] = None) -> None:
+    def clear_cf_clearance(self, host: Optional[str] = None, user_agent: Optional[str] = None) -> None:
         """Clear stored cf_clearance entries."""
-        self.addon.clear_cf_clearance(host)
+        self.addon.clear_cf_clearance(host, user_agent)
 
 
 def start_transparent_proxy(
