@@ -23,14 +23,62 @@ import logging
 import time
 import threading
 import asyncio
-from typing import Optional, Dict, Any
-from urllib.parse import urlparse
+from typing import Optional, Dict, Any, Tuple
+from urllib.parse import urlparse, unquote
 
 from curl_cffi.requests import Session, Response
 from pywssocks import WSSocksClient
 
+from .exceptions import (
+    CFSolverError,
+    CFSolverAPIError,
+    CFSolverChallengeError,
+    CFSolverTimeoutError,
+    CFSolverConnectionError,
+)
+
 
 logger = logging.getLogger(__name__)
+
+# Global cache for clearance data (shared across instances)
+_clearance_cache: Dict[str, Dict[str, Any]] = {}
+_clearance_cache_lock = threading.Lock()
+
+
+def _parse_proxy(proxy_url: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Parse a proxy URL and return address, username, password, and type.
+    
+    Args:
+        proxy_url: URL string in format scheme://[user:pass@]host[:port]
+                   Supported schemes: socks5, http, https
+        
+    Returns:
+        Tuple of (address, username, password, proxy_type), all None if invalid
+    """
+    if not proxy_url:
+        return None, None, None, None
+
+    try:
+        u = urlparse(proxy_url)
+    except Exception:
+        return None, None, None, None
+
+    if u.scheme not in ("socks5", "http", "https"):
+        return None, None, None, None
+
+    username = unquote(u.username) if u.username else None
+    password = unquote(u.password) if u.password else None
+
+    host = u.hostname
+    if u.scheme == "socks5":
+        port = u.port or 1080
+        proxy_type = "socks5"
+    else:
+        port = u.port or 8080
+        proxy_type = "http"
+    address = f"{host}:{port}"
+
+    return address, username, password, proxy_type
 
 
 def _raise_for_status(resp):
@@ -94,15 +142,63 @@ class CloudflareSolver:
         self.api_proxy = api_proxy
         self.impersonate = impersonate
         self.use_polling = use_polling
+        self.use_cache = use_cache
         
         self._client: Optional[WSSocksClient] = None
         self._client_thread: Optional[threading.Thread] = None
-        self._session = Session(
-            verify=False,
-            proxy=self.user_proxy,
-            impersonate=self.impersonate,
-        )
         self._linksocks_config: Optional[Dict[str, Any]] = None
+        
+        # Session state
+        self._session: Optional[Session] = None
+        self._ja3: Optional[str] = None
+        self._akamai: Optional[str] = None
+        
+        # Thread lock for session operations
+        self._lock = threading.Lock()
+    
+    def _get_session(self) -> Session:
+        """Get or create the HTTP session with current fingerprint settings."""
+        if self._session is None:
+            if self._ja3 or self._akamai:
+                self._session = Session(
+                    verify=False,
+                    proxy=self.user_proxy,
+                    ja3=self._ja3,
+                    akamai=self._akamai,
+                )
+            else:
+                self._session = Session(
+                    verify=False,
+                    proxy=self.user_proxy,
+                    impersonate=self.impersonate,
+                )
+        return self._session
+    
+    def _reset_session(self, ja3: Optional[str] = None, akamai: Optional[str] = None):
+        """Reset session with new TLS fingerprints, preserving cookies and headers.
+        
+        Only rebuilds if fingerprints actually changed.
+        """
+        if self._ja3 == ja3 and self._akamai == akamai:
+            return
+        
+        old_cookies = {}
+        old_headers = {}
+        
+        if self._session:
+            old_cookies = dict(self._session.cookies)
+            old_headers = dict(self._session.headers)
+            self._session.close()
+            self._session = None
+        
+        self._ja3 = ja3
+        self._akamai = akamai
+        
+        session = self._get_session()
+        for k, v in old_cookies.items():
+            session.cookies.set(k, v)
+        for k, v in old_headers.items():
+            session.headers[k] = v
     
     @staticmethod
     def _normalize_ws_url(url: str) -> str:
