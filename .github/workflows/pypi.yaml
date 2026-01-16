@@ -58,22 +58,21 @@ jobs:
             --generate-notes
 
   publish:
-    needs: [build]
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       id-token: write
     steps:
-      - name: Download dists
-        uses: actions/download-artifact@v4
-        with:
-          name: "dist"
-          path: "dist/"
-      - name: Upload to GitHub Release
+      - name: Download assets from Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload ${{ github.ref_name }} dist/* --repo ${{ github.repository }} --clobber
+          mkdir -p dist
+          gh release download ${{ github.event.release.tag_name }} \
+            --repo ${{ github.repository }} \
+            --pattern "*.whl" \
+            --pattern "*.tar.gz" \
+            --dir dist
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
