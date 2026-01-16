@@ -94,7 +94,7 @@ class TestChallengeDetection:
         mock_resp = MagicMock()
         mock_resp.status_code = 503
         mock_resp.headers = {"Server": "cloudflare"}
-        mock_resp.text = "Checking your browser before accessing"
+        mock_resp.text = "Just a moment..."
 
         assert solver._detect_challenge(mock_resp) is True
         solver.close()
