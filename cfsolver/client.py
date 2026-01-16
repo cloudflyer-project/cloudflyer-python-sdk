@@ -450,12 +450,16 @@ class CloudflareSolver:
                 # Choose endpoint based on polling strategy
                 if self.use_polling:
                     endpoint = f"{self.api_base}/api/getTaskResult"
+                    request_timeout = 30
                 else:
                     endpoint = f"{self.api_base}/api/waitTaskResult"
+                    # Long-polling needs longer timeout (remaining time + buffer)
+                    request_timeout = min(timeout - (time.time() - start) + 10, 310)
                 
                 res = poll_session.post(
                     endpoint,
                     json={"apiKey": self.api_key, "taskId": task_id},
+                    timeout=request_timeout,
                 )
                 
                 if res.status_code != 200:
