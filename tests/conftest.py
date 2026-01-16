@@ -31,9 +31,16 @@ def load_env():
 load_env()
 
 
+def pytest_configure(config):
+    """Register custom markers."""
+    config.addinivalue_line(
+        "markers", "integration: mark test as integration test (requires API key)"
+    )
+
+
 @pytest.fixture
 def api_url() -> str:
-    return os.environ.get("CLOUDFLYER_API_URL", "http://localhost:8000").rstrip("/")
+    return os.environ.get("CLOUDFLYER_API_BASE", os.environ.get("CLOUDFLYER_API_URL", "https://solver.zetx.site")).rstrip("/")
 
 
 @pytest.fixture
@@ -47,4 +54,13 @@ def solver_kwargs(api_url, api_key):
     return {
         "api_key": api_key,
         "api_base": api_url,
+    }
+
+
+@pytest.fixture
+def mock_solver_kwargs():
+    """Kwargs for unit tests that don't need real API."""
+    return {
+        "api_key": "test-api-key",
+        "api_base": "https://solver.zetx.site",
     }
