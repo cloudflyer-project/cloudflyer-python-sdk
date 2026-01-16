@@ -24,7 +24,7 @@ classifiers = [
 ]
 requires-python = ">=3.8"
 dependencies = [
-    "pywssocks>=1.5.0",
+    "pywssocks>=1.5.1",
     "curl_cffi>=0.7.0",
     "click>=8.0.0",
 ]
