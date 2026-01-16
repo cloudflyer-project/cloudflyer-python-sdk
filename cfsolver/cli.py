@@ -172,7 +172,7 @@ def solve_turnstile(ctx, url, sitekey, api_key, api_base, api_proxy, timeout, ou
 @click.option("-B", "--api-base", help="API base URL (default: https://solver.zetx.site)")
 @click.option("-H", "--host", default="127.0.0.1", help="Listen address (default: 127.0.0.1)")
 @click.option("-P", "--port", type=int, default=8080, help="Listen port (default: 8080)")
-@click.option("-X", "--proxy", help="Upstream proxy (scheme://host:port)")
+@click.option("-X", "--proxy", help="Proxy for all requests (socks5://host:port or http://host:port)")
 @click.option("--api-proxy", help="Proxy for API calls (scheme://host:port)")
 @click.option("-I", "--impersonate", default="chrome", help="Browser to impersonate (default: chrome)")
 @click.option("-D", "--disable-detection", is_flag=True, help="Disable challenge detection (proxy-only mode)")
@@ -185,8 +185,13 @@ def proxy(ctx, api_key, api_base, host, port, proxy, api_proxy, impersonate, dis
     The proxy automatically detects and solves Cloudflare challenges using the cloud API.
     Configure your application to use this proxy (http://host:port) for automatic bypass.
     
+    The --proxy option specifies a proxy that will be used for:
+    1. Normal requests (via mitmproxy upstream)
+    2. Challenge solving (via linksocks tunnel, requires socks5://)
+    
     Example:
         cfsolver proxy -K your_api_key -P 8080
+        cfsolver proxy -K your_api_key -X socks5://127.0.0.1:1080
         curl -x http://127.0.0.1:8080 https://protected-site.com
     """
     from .tproxy import start_transparent_proxy
@@ -203,7 +208,7 @@ def proxy(ctx, api_key, api_base, host, port, proxy, api_proxy, impersonate, dis
             api_base=api_base,
             host=host,
             port=port,
-            upstream_proxy=proxy,
+            user_proxy=proxy,
             api_proxy=api_proxy,
             impersonate=impersonate,
             enable_detection=not disable_detection,
@@ -308,9 +313,9 @@ def balance(ctx, api_key, api_base, api_proxy):
     
     try:
         with Session(verify=False, proxy=api_proxy) as session:
-            resp = session.get(
+            resp = session.post(
                 f"{api_base}/api/getBalance",
-                params={"apiKey": api_key},
+                json={"clientKey": api_key},
             )
             
             if resp.status_code != 200:
