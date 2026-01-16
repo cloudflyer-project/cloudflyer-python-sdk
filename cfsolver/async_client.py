@@ -232,10 +232,18 @@ class AsyncCloudflareSolver:
             return
         try:
             self._linksocks_config = await self._get_linksocks_config()
+            
+            # Parse upstream proxy if provided (supports socks5:// and http://)
+            upstream_host, upstream_username, upstream_password, upstream_type = _parse_proxy(self.user_proxy)
+            
             self._client = WSSocksClient(
                 ws_url=self._linksocks_config["url"],
                 token=self._linksocks_config["token"],
-                reverse=True
+                reverse=True,
+                upstream_proxy=upstream_host,
+                upstream_username=upstream_username,
+                upstream_password=upstream_password,
+                upstream_proxy_type=upstream_type,
             )
             self._client_task = await self._client.wait_ready(timeout=10)
             logger.info("LinkSocks Provider established")

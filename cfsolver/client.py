@@ -242,12 +242,19 @@ class CloudflareSolver:
         try:
             self._linksocks_config = self._get_linksocks_config()
             
+            # Parse upstream proxy if provided (supports socks5:// and http://)
+            upstream_host, upstream_username, upstream_password, upstream_type = _parse_proxy(self.user_proxy)
+            
             def run_client():
                 async def _start():
                     self._client = WSSocksClient(
                         ws_url=self._linksocks_config["url"],
                         token=self._linksocks_config["token"],
                         reverse=True,
+                        upstream_proxy=upstream_host,
+                        upstream_username=upstream_username,
+                        upstream_password=upstream_password,
+                        upstream_proxy_type=upstream_type,
                     )
                     task = await self._client.wait_ready(timeout=10)
                     await task
