@@ -403,31 +403,19 @@ def request(
 @click.pass_context
 def balance(ctx, api_key, api_base, api_proxy):
     """Check account balance."""
-    from curl_cffi.requests import Session
+    from .client import CloudflareSolver
 
     api_key = get_api_key(api_key)
     api_base = get_api_base(api_base)
 
     try:
-        with Session(verify=False, proxy=api_proxy) as session:
-            resp = session.post(
-                f"{api_base}/api/getBalance",
-                json={"clientKey": api_key},
-            )
-
-            if resp.status_code != 200:
-                click.echo(f"[x] Error: HTTP {resp.status_code}", err=True)
-                sys.exit(1)
-
-            data = resp.json()
-            if data.get("errorId"):
-                click.echo(
-                    f"[x] Error: {data.get('errorDescription', 'Unknown error')}",
-                    err=True,
-                )
-                sys.exit(1)
-
-            balance_val = data.get("balance", 0)
+        with CloudflareSolver(
+            api_key=api_key,
+            api_base=api_base,
+            api_proxy=api_proxy,
+            solve=False,
+        ) as solver:
+            balance_val = solver.get_balance()
             click.echo(f"[+] Balance: {balance_val}")
 
     except Exception as e:

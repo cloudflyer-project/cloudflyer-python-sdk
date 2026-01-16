@@ -535,6 +535,31 @@ class CloudflareSolver:
 
         raise CFSolverTimeoutError("Task timed out")
 
+    def get_balance(self) -> float:
+        """
+        Get the current account balance.
+
+        Returns:
+            The account balance as a float
+
+        Raises:
+            CFSolverAPIError: If the API request fails
+        """
+        with Session(verify=False, proxy=self.api_proxy) as api_session:
+            resp = api_session.post(
+                f"{self.api_base}/api/getBalance",
+                json={"clientKey": self.api_key},
+            )
+            _raise_for_status(resp)
+            data = resp.json()
+
+        if data.get("errorId"):
+            raise CFSolverAPIError(
+                f"Failed to get balance: {data.get('errorDescription', 'Unknown error')}"
+            )
+
+        return float(data.get("balance", 0))
+
     def solve_turnstile(self, url: str, sitekey: str) -> str:
         """
         Solve a Turnstile challenge and return the token.
