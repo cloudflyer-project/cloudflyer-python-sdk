@@ -1,11 +1,25 @@
 from .client import CloudflareSolver
 from .async_client import AsyncCloudflareSolver
+from .exceptions import (
+    CFSolverError,
+    CFSolverAPIError,
+    CFSolverChallengeError,
+    CFSolverTimeoutError,
+    CFSolverConnectionError,
+    CFSolverProxyError,
+)
 
 __version__ = "0.2.0"
 
 __all__ = [
     "CloudflareSolver",
     "AsyncCloudflareSolver",
+    "CFSolverError",
+    "CFSolverAPIError",
+    "CFSolverChallengeError",
+    "CFSolverTimeoutError",
+    "CFSolverConnectionError",
+    "CFSolverProxyError",
     "__version__",
 ]
 
