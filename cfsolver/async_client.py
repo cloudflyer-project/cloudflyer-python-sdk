@@ -86,7 +86,7 @@ def _raise_for_status(resp):
         except:
             if resp.text:
                 error_detail = resp.text[:200]
-        raise RuntimeError(f"API request failed: {error_detail}")
+        raise CFSolverAPIError(f"API request failed: {error_detail}")
 
 
 class AsyncCloudflareSolver:
@@ -221,7 +221,7 @@ class AsyncCloudflareSolver:
                     error_detail = error_data["detail"]
             except:
                 error_detail = resp.text or error_detail
-            raise RuntimeError(f"Failed to get linksocks config: {error_detail}")
+            raise CFSolverConnectionError(f"Failed to get linksocks config: {error_detail}")
         config = resp.json()
         if "url" in config:
             config["url"] = self._normalize_ws_url(config["url"])
@@ -243,7 +243,7 @@ class AsyncCloudflareSolver:
             logger.error(f"Connection setup failed: {e}")
             self._last_connect_error = str(e)
             if self.solve and not self.on_challenge:
-                raise RuntimeError(f"Failed to connect to CloudFlyer service: {e}")
+                raise CFSolverConnectionError(f"Failed to connect to CloudFlyer service: {e}")
 
     def _detect_challenge(self, resp: Response) -> bool:
         if resp.status_code not in (403, 503):
@@ -408,8 +408,8 @@ class AsyncCloudflareSolver:
             The task result dictionary
         
         Raises:
-            RuntimeError: If task fails
-            TimeoutError: If timeout is reached
+            CFSolverChallengeError: If task fails
+            CFSolverTimeoutError: If timeout is reached
         """
         start = time.time()
         
@@ -457,11 +457,11 @@ class AsyncCloudflareSolver:
                     or worker_result.get("error")
                     or f"Unknown error (full response: {result})"
                 )
-                raise RuntimeError(f"Task failed: {error}")
+                raise CFSolverChallengeError(f"Task failed: {error}")
             
             return result
         
-        raise TimeoutError("Task timed out")
+        raise CFSolverTimeoutError("Task timed out")
     
     async def solve_turnstile(self, url: str, sitekey: str) -> str:
         """
@@ -475,8 +475,8 @@ class AsyncCloudflareSolver:
             The solved Turnstile token to submit with your form
         
         Raises:
-            RuntimeError: If task creation or solving fails
-            TimeoutError: If solving takes too long
+            CFSolverChallengeError: If task creation or solving fails
+            CFSolverTimeoutError: If solving takes too long
         """
         logger.info(f"Starting Turnstile solve: {url}")
         
@@ -495,17 +495,17 @@ class AsyncCloudflareSolver:
         data = resp.json()
         
         if data.get("errorId"):
-            raise RuntimeError(f"Turnstile solve failed: {data.get('errorDescription')}")
+            raise CFSolverChallengeError(f"Turnstile solve failed: {data.get('errorDescription')}")
         
         task_id = data["taskId"]
         logger.debug(f"Turnstile task created: {task_id}")
         
         try:
             result = await self._wait_for_result(task_id)
-        except RuntimeError as e:
-            raise RuntimeError(f"Turnstile solve failed: {e}")
-        except TimeoutError:
-            raise TimeoutError("Turnstile solve timed out")
+        except CFSolverChallengeError as e:
+            raise CFSolverChallengeError(f"Turnstile solve failed: {e}")
+        except CFSolverTimeoutError:
+            raise CFSolverTimeoutError("Turnstile solve timed out")
         
         worker_result = result.get("result") or {}
         if isinstance(worker_result.get("result"), dict):
