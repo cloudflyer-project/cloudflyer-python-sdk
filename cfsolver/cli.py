@@ -20,6 +20,16 @@ def setup_logging(verbose: bool = False):
         level=level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
+    
+    # Suppress noisy loggers even in verbose mode
+    logging.getLogger("hpack").setLevel(logging.WARNING)
+    logging.getLogger("hpack.hpack").setLevel(logging.WARNING)
+    logging.getLogger("hpack.table").setLevel(logging.WARNING)
+    logging.getLogger("pywssocks").setLevel(logging.WARNING)
+    logging.getLogger("pywssocks.relay").setLevel(logging.WARNING)
+    logging.getLogger("pywssocks.relay.ws").setLevel(logging.WARNING)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("passlib").setLevel(logging.WARNING)
 
 
 @click.group()
