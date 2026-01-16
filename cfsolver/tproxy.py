@@ -426,32 +426,43 @@ class CloudAPITransparentProxy:
         api_base: str = "https://solver.zetx.site",
         host: str = "127.0.0.1",
         port: int = 8080,
-        upstream_proxy: Optional[str] = None,
+        user_proxy: Optional[str] = None,
         api_proxy: Optional[str] = None,
         impersonate: str = "chrome",
         enable_detection: bool = True,
         no_cache: bool = False,
         timeout: int = 120,
+        extra_title_indicators: Optional[list] = None,
+        extra_cf_indicators: Optional[list] = None,
     ):
         self.api_key = api_key
         self.api_base = api_base
         self.host = host
         self.port = port
-        self.upstream_proxy = upstream_proxy
+        self.user_proxy = user_proxy
         self.api_proxy = api_proxy
         self.impersonate = impersonate
         self.enable_detection = enable_detection
         self.no_cache = no_cache
         self.timeout = timeout
+        
+        # pproxy bridge for SOCKS proxy support
+        self._pproxy_server = None
+        self._pproxy_thread = None
+        self._pproxy_port = None
+        self._effective_upstream = None  # The actual upstream proxy for mitmproxy
 
         self.addon = CloudAPIProxyAddon(
             api_key=api_key,
             api_base=api_base,
+            user_proxy=user_proxy,
             api_proxy=api_proxy,
             impersonate=impersonate,
             enable_detection=enable_detection,
             no_cache=no_cache,
             timeout=timeout,
+            extra_title_indicators=extra_title_indicators,
+            extra_cf_indicators=extra_cf_indicators,
         )
         
         self._master = None
@@ -459,11 +470,110 @@ class CloudAPITransparentProxy:
         self._running = False
         self._loop = None
         self._started_event = threading.Event()
+    
+    def _find_free_port(self) -> int:
+        """Find a free port for pproxy."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('127.0.0.1', 0))
+            return s.getsockname()[1]
+    
+    def _parse_proxy_url(self, proxy_url: str) -> Tuple[str, Optional[str], Optional[str]]:
+        """Parse proxy URL and return (scheme, host:port, auth)."""
+        parsed = urlparse(proxy_url)
+        scheme = parsed.scheme.lower()
+        
+        host_port = parsed.hostname
+        if parsed.port:
+            host_port = f"{parsed.hostname}:{parsed.port}"
+        
+        auth = None
+        if parsed.username:
+            if parsed.password:
+                auth = f"{parsed.username}:{parsed.password}"
+            else:
+                auth = parsed.username
+        
+        return scheme, host_port, auth
+    
+    def _start_pproxy_bridge(self, socks_proxy: str) -> str:
+        """Start pproxy as HTTP-to-SOCKS bridge and return local HTTP proxy URL."""
+        try:
+            import pproxy
+        except ImportError:
+            raise CFSolverProxyError(
+                "pproxy is required for SOCKS proxy support. Install it with: pip install pproxy"
+            )
+        
+        scheme, host_port, auth = self._parse_proxy_url(socks_proxy)
+        
+        # Build pproxy remote URI
+        if auth:
+            remote_uri = f"{scheme}://{host_port}#{auth}"
+        else:
+            remote_uri = f"{scheme}://{host_port}"
+        
+        self._pproxy_port = self._find_free_port()
+        local_uri = f"http://127.0.0.1:{self._pproxy_port}"
+        
+        logger.info(f"Starting pproxy bridge on port {self._pproxy_port} -> {scheme}://{host_port}")
+        
+        def run_pproxy():
+            pproxy_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(pproxy_loop)
+            
+            try:
+                server = pproxy.Server(local_uri)
+                remote = pproxy.Connection(remote_uri)
+                args = dict(rserver=[remote], verbose=lambda x: logger.debug(f"pproxy: {x}"))
+                
+                handler = pproxy_loop.run_until_complete(server.start_server(args))
+                self._pproxy_server = handler
+                
+                pproxy_loop.run_forever()
+            except Exception as e:
+                logger.error(f"pproxy error: {e}")
+            finally:
+                if self._pproxy_server:
+                    self._pproxy_server.close()
+                pproxy_loop.close()
+        
+        self._pproxy_thread = threading.Thread(target=run_pproxy, daemon=True)
+        self._pproxy_thread.start()
+        
+        # Wait for pproxy to start
+        time.sleep(0.5)
+        
+        return f"http://127.0.0.1:{self._pproxy_port}"
+    
+    def _stop_pproxy_bridge(self):
+        """Stop the pproxy bridge."""
+        if self._pproxy_server:
+            try:
+                self._pproxy_server.close()
+            except Exception:
+                pass
+            self._pproxy_server = None
+        self._pproxy_thread = None
+        self._pproxy_port = None
 
     def start(self):
         """Start the transparent proxy server."""
         if self._running:
-            raise RuntimeError("Proxy is already running")
+            raise CFSolverProxyError("Proxy is already running")
+        
+        # Determine effective upstream proxy for mitmproxy
+        # mitmproxy doesn't support SOCKS5 upstream directly, so we use pproxy as bridge
+        if self.user_proxy:
+            parsed = urlparse(self.user_proxy)
+            if parsed.scheme.lower() in ('socks5', 'socks4', 'socks'):
+                # Start pproxy bridge for SOCKS proxy
+                self._effective_upstream = self._start_pproxy_bridge(self.user_proxy)
+                logger.info(f"Using pproxy bridge for SOCKS proxy: {self._effective_upstream}")
+            else:
+                # HTTP proxy can be used directly
+                self._effective_upstream = self.user_proxy
+        else:
+            self._effective_upstream = None
 
         def run_proxy():
             if hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
@@ -492,7 +602,7 @@ class CloudAPITransparentProxy:
                 self.stop()
             except Exception:
                 pass
-            raise RuntimeError("Failed to start transparent proxy")
+            raise CFSolverProxyError("Failed to start transparent proxy")
 
         logger.info(f"Transparent proxy started on {self.host}:{self.port}")
 
@@ -501,8 +611,8 @@ class CloudAPITransparentProxy:
         try:
             # Configure proxy options
             mode = []
-            if self.upstream_proxy:
-                mode.append(f"upstream:{self.upstream_proxy}")
+            if self._effective_upstream:
+                mode.append(f"upstream:{self._effective_upstream}")
             else:
                 mode.append("regular")
 
@@ -578,12 +688,14 @@ def start_transparent_proxy(
     api_base: str = "https://solver.zetx.site",
     host: str = "127.0.0.1",
     port: int = 8080,
-    upstream_proxy: Optional[str] = None,
+    user_proxy: Optional[str] = None,
     api_proxy: Optional[str] = None,
     impersonate: str = "chrome",
     enable_detection: bool = True,
     no_cache: bool = False,
     timeout: int = 120,
+    extra_title_indicators: Optional[list] = None,
+    extra_cf_indicators: Optional[list] = None,
 ):
     """Start transparent proxy server with configuration.
     
@@ -592,24 +704,28 @@ def start_transparent_proxy(
         api_base: CloudFlyer API base URL
         host: Listen address (default: 127.0.0.1)
         port: Listen port (default: 8080)
-        upstream_proxy: Upstream proxy for forwarding requests
+        user_proxy: Proxy for all requests (mitmproxy upstream + linksocks tunnel)
         api_proxy: Proxy for API calls to CloudFlyer
         impersonate: Browser to impersonate (default: chrome)
         enable_detection: Enable Cloudflare challenge detection
         no_cache: Disable cf_clearance caching
         timeout: Challenge solve timeout in seconds
+        extra_title_indicators: Additional title patterns to detect challenge pages
+        extra_cf_indicators: Additional Cloudflare-specific indicators
     """
     proxy = CloudAPITransparentProxy(
         api_key=api_key,
         api_base=api_base,
         host=host,
         port=port,
-        upstream_proxy=upstream_proxy,
+        user_proxy=user_proxy,
         api_proxy=api_proxy,
         impersonate=impersonate,
         enable_detection=enable_detection,
         no_cache=no_cache,
         timeout=timeout,
+        extra_title_indicators=extra_title_indicators,
+        extra_cf_indicators=extra_cf_indicators,
     )
 
     shutdown_event = threading.Event()
