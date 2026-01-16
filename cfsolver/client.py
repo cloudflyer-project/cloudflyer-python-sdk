@@ -113,6 +113,8 @@ class CloudflareSolver:
         use_polling: Use interval polling instead of long-polling (default: False).
             When False, uses /waitTaskResult for efficient long-polling.
             When True, uses /getTaskResult with 2-second intervals.
+        use_cache: Cache clearance data per host to avoid redundant solves (default: True).
+            Cached data includes cookies, user agent, and TLS fingerprints.
     
     Examples:
         >>> solver = CloudflareSolver("your_api_key")
@@ -133,6 +135,7 @@ class CloudflareSolver:
         api_proxy: Optional[str] = None,
         impersonate: str = "chrome",
         use_polling: bool = False,
+        use_cache: bool = True,
     ):
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
@@ -274,66 +277,149 @@ class CloudflareSolver:
         text = resp.text
         return any(k in text for k in ["cf-turnstile", "cf-challenge", "Just a moment"])
     
-    def _solve_challenge(self, url: str, html: Optional[str] = None):
-        # Lazy connect: only connect to linksocks when actually solving a challenge
-        self._connect()
+    def _get_cache_key(self, url: str) -> str:
+        """Generate cache key from URL host and proxy."""
+        host = urlparse(url).hostname or ""
+        proxy_key = self.user_proxy or "direct"
+        return f"{host}|{proxy_key}"
+    
+    def _load_from_cache(self, url: str) -> bool:
+        """Load clearance data from cache if available. Returns True if loaded."""
+        if not self.use_cache:
+            return False
         
-        if not self._linksocks_config:
-            error_detail = getattr(self, '_last_connect_error', 'connection failed')
-            raise RuntimeError(f"CloudFlyer service unavailable: {error_detail}")
+        cache_key = self._get_cache_key(url)
+        with _clearance_cache_lock:
+            cached = _clearance_cache.get(cache_key)
+            if not cached:
+                return False
+            
+            logger.debug(f"Loading clearance from cache for {cache_key}")
+            
+            # Apply cached TLS fingerprints
+            ja3 = cached.get("ja3")
+            akamai = cached.get("akamai")
+            if ja3 or akamai:
+                self._reset_session(ja3=ja3, akamai=akamai)
+            
+            # Apply cached cookies and user agent
+            session = self._get_session()
+            domain = urlparse(url).hostname
+            for k, v in cached.get("cookies", {}).items():
+                session.cookies.set(k, v, domain=domain)
+            
+            if cached.get("user_agent"):
+                session.headers["User-Agent"] = cached["user_agent"]
+            
+            return True
+    
+    def _save_to_cache(self, url: str, cookies: Dict[str, str], user_agent: Optional[str],
+                       ja3: Optional[str], akamai: Optional[str]):
+        """Save clearance data to cache."""
+        if not self.use_cache:
+            return
         
-        logger.info(f"Starting challenge solve: {url}")
+        cache_key = self._get_cache_key(url)
+        with _clearance_cache_lock:
+            _clearance_cache[cache_key] = {
+                "cookies": cookies,
+                "user_agent": user_agent,
+                "ja3": ja3,
+                "akamai": akamai,
+            }
+            logger.debug(f"Saved clearance to cache for {cache_key}")
+    
+    @staticmethod
+    def clear_cache(host: Optional[str] = None):
+        """Clear clearance cache.
         
-        with Session(verify=False, proxy=self.api_proxy) as api_session:
-            resp = api_session.post(
-                f"{self.api_base}/api/createTask",
-                json={
-                    "apiKey": self.api_key,
-                    "task": {
-                        "type": "CloudflareTask",
-                        "websiteURL": url,
-                        "linksocks": {
-                            "url": self._linksocks_config["url"],
-                            "token": self._linksocks_config["connector_token"],
+        Args:
+            host: If provided, only clear cache for this host. Otherwise clear all.
+        """
+        with _clearance_cache_lock:
+            if host:
+                keys_to_remove = [k for k in _clearance_cache if k.startswith(f"{host}|")]
+                for k in keys_to_remove:
+                    del _clearance_cache[k]
+            else:
+                _clearance_cache.clear()
+    
+    def _solve_challenge(self, url: str, html: Optional[str] = None, use_cache: Optional[bool] = None):
+        _use_cache = self.use_cache if use_cache is None else use_cache
+        with self._lock:
+            # Lazy connect: only connect to linksocks when actually solving a challenge
+            self._connect()
+            
+            if not self._linksocks_config:
+                error_detail = getattr(self, '_last_connect_error', 'connection failed')
+                raise CFSolverConnectionError(f"CloudFlyer service unavailable: {error_detail}")
+            
+            logger.info(f"Starting challenge solve: {url}")
+            
+            with Session(verify=False, proxy=self.api_proxy) as api_session:
+                resp = api_session.post(
+                    f"{self.api_base}/api/createTask",
+                    json={
+                        "apiKey": self.api_key,
+                        "task": {
+                            "type": "CloudflareTask",
+                            "websiteURL": url,
+                            "linksocks": {
+                                "url": self._linksocks_config["url"],
+                                "token": self._linksocks_config["connector_token"],
+                            },
                         },
                     },
-                },
-            )
-            _raise_for_status(resp)
-            data = resp.json()
-        
-        if data.get("errorId"):
-            raise RuntimeError(f"Challenge solve failed: {data.get('errorDescription')}")
-        
-        task_id = data["taskId"]
-        logger.debug(f"Task created: {task_id}")
-        
-        result = self._wait_for_result(task_id)
-        
-        # Extract normalized solution from worker result structure
-        worker_result = result.get("result") or {}
-        if isinstance(worker_result.get("result"), dict):
-            solution = worker_result["result"]
-        else:
-            solution = worker_result
+                )
+                _raise_for_status(resp)
+                data = resp.json()
+            
+            if data.get("errorId"):
+                raise CFSolverChallengeError(f"Challenge solve failed: {data.get('errorDescription')}")
+            
+            task_id = data["taskId"]
+            logger.debug(f"Task created: {task_id}")
+            
+            result = self._wait_for_result(task_id)
+            
+            # Extract normalized solution from worker result structure
+            worker_result = result.get("result") or {}
+            logger.debug(f"Retrieved task result:\n{worker_result}")
+            if isinstance(worker_result.get("result"), dict):
+                solution = worker_result["result"]
+            else:
+                solution = worker_result
 
-        if not isinstance(solution, dict):
-            raise RuntimeError("Challenge solve failed: invalid response from server")
+            if not isinstance(solution, dict):
+                raise CFSolverChallengeError("Challenge solve failed: invalid response from server")
 
-        cookies = solution.get("cookies", {})
-        user_agent = solution.get("userAgent")
-        headers = solution.get("headers")
-        if not user_agent and isinstance(headers, dict):
-            user_agent = headers.get("User-Agent")
+            cookies = solution.get("cookies", {})
+            user_agent = solution.get("userAgent")
+            headers = solution.get("headers")
+            if not user_agent and isinstance(headers, dict):
+                user_agent = headers.get("User-Agent")
 
-        domain = urlparse(url).hostname
-        for k, v in cookies.items():
-            self._session.cookies.set(k, v, domain=domain)
+            # Apply TLS fingerprints if provided
+            ja3_text = solution.get("ja3_text")
+            akamai_text = solution.get("akamai_text")
+            if ja3_text or akamai_text:
+                logger.debug(f"Applying TLS fingerprints - JA3: {ja3_text[:50] if ja3_text else 'N/A'}...")
+                self._reset_session(ja3=ja3_text, akamai=akamai_text)
 
-        if user_agent:
-            self._session.headers["User-Agent"] = user_agent
+            # Apply cookies and user agent
+            session = self._get_session()
+            domain = urlparse(url).hostname
+            for k, v in cookies.items():
+                session.cookies.set(k, v, domain=domain)
 
-        logger.info("Challenge solved successfully")
+            if user_agent:
+                session.headers["User-Agent"] = user_agent
+
+            # Save to cache
+            if _use_cache:
+                self._save_to_cache(url, cookies, user_agent, ja3_text, akamai_text)
+
+            logger.info("Challenge solved successfully")
     
     def _wait_for_result(self, task_id: str, timeout: int = 120) -> Dict[str, Any]:
         """
@@ -456,55 +542,147 @@ class CloudflareSolver:
         
         token = solution.get("token")
         if not token:
-            raise RuntimeError("Turnstile solve failed: no token returned")
+            raise CFSolverChallengeError("Turnstile solve failed: no token returned")
         
         logger.info("Turnstile solved successfully")
         return token
     
-    def request(self, method: str, url: str, **kwargs) -> Response:
-        if not self.solve:
-            return self._session.request(method, url, **kwargs)
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        solve: Optional[bool] = None,
+        on_challenge: Optional[bool] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ) -> Response:
+        """
+        Send an HTTP request with optional Cloudflare challenge bypass.
         
-        if not self.on_challenge:
+        Args:
+            method: HTTP method (GET, POST, etc.)
+            url: Target URL
+            solve: Override instance-level solve setting for this request
+            on_challenge: Override instance-level on_challenge setting for this request
+            use_cache: Override instance-level use_cache setting for this request
+            **kwargs: Additional arguments passed to curl_cffi session.request()
+        
+        Returns:
+            Response object
+        """
+        # Use per-request overrides or fall back to instance defaults
+        _solve = self.solve if solve is None else solve
+        _on_challenge = self.on_challenge if on_challenge is None else on_challenge
+        _use_cache = self.use_cache if use_cache is None else use_cache
+        
+        # Try to load from cache first
+        if _use_cache:
+            self._load_from_cache(url)
+        session = self._get_session()
+        
+        if not _solve:
+            return session.request(method, url, **kwargs)
+        
+        if not _on_challenge:
             # Always pre-solve
             try:
-                self._solve_challenge(url)
+                self._solve_challenge(url, use_cache=_use_cache)
+                session = self._get_session()
             except Exception as e:
                 logger.warning(f"Pre-solve failed: {e}")
         
-        resp = self._session.request(method, url, **kwargs)
+        resp = session.request(method, url, **kwargs)
         
-        if self.on_challenge and self._detect_challenge(resp):
+        if _on_challenge and self._detect_challenge(resp):
             logger.info("Cloudflare challenge detected")
-            self._solve_challenge(url, resp.text)
-            resp = self._session.request(method, url, **kwargs)
+            self._solve_challenge(url, resp.text, use_cache=_use_cache)
+            session = self._get_session()
+            resp = session.request(method, url, **kwargs)
         
         return resp
     
-    def get(self, url: str, **kwargs) -> Response:
-        return self.request("GET", url, **kwargs)
+    def get(
+        self,
+        url: str,
+        *,
+        solve: Optional[bool] = None,
+        on_challenge: Optional[bool] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ) -> Response:
+        return self.request("GET", url, solve=solve, on_challenge=on_challenge, use_cache=use_cache, **kwargs)
     
-    def post(self, url: str, **kwargs) -> Response:
-        return self.request("POST", url, **kwargs)
+    def post(
+        self,
+        url: str,
+        *,
+        solve: Optional[bool] = None,
+        on_challenge: Optional[bool] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ) -> Response:
+        return self.request("POST", url, solve=solve, on_challenge=on_challenge, use_cache=use_cache, **kwargs)
     
-    def put(self, url: str, **kwargs) -> Response:
-        return self.request("PUT", url, **kwargs)
+    def put(
+        self,
+        url: str,
+        *,
+        solve: Optional[bool] = None,
+        on_challenge: Optional[bool] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ) -> Response:
+        return self.request("PUT", url, solve=solve, on_challenge=on_challenge, use_cache=use_cache, **kwargs)
     
-    def delete(self, url: str, **kwargs) -> Response:
-        return self.request("DELETE", url, **kwargs)
+    def delete(
+        self,
+        url: str,
+        *,
+        solve: Optional[bool] = None,
+        on_challenge: Optional[bool] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ) -> Response:
+        return self.request("DELETE", url, solve=solve, on_challenge=on_challenge, use_cache=use_cache, **kwargs)
     
-    def head(self, url: str, **kwargs) -> Response:
-        return self.request("HEAD", url, **kwargs)
+    def head(
+        self,
+        url: str,
+        *,
+        solve: Optional[bool] = None,
+        on_challenge: Optional[bool] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ) -> Response:
+        return self.request("HEAD", url, solve=solve, on_challenge=on_challenge, use_cache=use_cache, **kwargs)
     
-    def options(self, url: str, **kwargs) -> Response:
-        return self.request("OPTIONS", url, **kwargs)
+    def options(
+        self,
+        url: str,
+        *,
+        solve: Optional[bool] = None,
+        on_challenge: Optional[bool] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ) -> Response:
+        return self.request("OPTIONS", url, solve=solve, on_challenge=on_challenge, use_cache=use_cache, **kwargs)
     
-    def patch(self, url: str, **kwargs) -> Response:
-        return self.request("PATCH", url, **kwargs)
+    def patch(
+        self,
+        url: str,
+        *,
+        solve: Optional[bool] = None,
+        on_challenge: Optional[bool] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ) -> Response:
+        return self.request("PATCH", url, solve=solve, on_challenge=on_challenge, use_cache=use_cache, **kwargs)
     
     def close(self):
         if self._session:
             self._session.close()
+            self._session = None
         logger.info("Session closed")
     
     def __enter__(self):
