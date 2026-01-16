@@ -20,8 +20,7 @@ pytestmark = pytest.mark.integration
 def requires_api_key(func):
     """Decorator to skip tests if API key is not available."""
     return pytest.mark.skipif(
-        not os.environ.get("CLOUDFLYER_API_KEY"),
-        reason="CLOUDFLYER_API_KEY not set"
+        not os.environ.get("CLOUDFLYER_API_KEY"), reason="CLOUDFLYER_API_KEY not set"
     )(func)
 
 
@@ -51,11 +50,17 @@ class TestIntegrationCloudflareChallenge:
             resp = solver.get(url)
 
             assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
-            assert "cf-turnstile" not in resp.text.lower() or "challenge" not in resp.text.lower(), \
-                "Challenge page still present after solving"
+            assert (
+                "cf-turnstile" not in resp.text.lower()
+                or "challenge" not in resp.text.lower()
+            ), "Challenge page still present after solving"
 
-            print(f"[Integration][CloudflareChallenge] Success! Status: {resp.status_code}")
-            print(f"[Integration][CloudflareChallenge] Cookies: {dict(solver._session.cookies)}")
+            print(
+                f"[Integration][CloudflareChallenge] Success! Status: {resp.status_code}"
+            )
+            print(
+                f"[Integration][CloudflareChallenge] Cookies: {dict(solver._session.cookies)}"
+            )
 
     @requires_api_key
     @pytest.mark.timeout(180)
@@ -69,7 +74,9 @@ class TestIntegrationCloudflareChallenge:
 
             assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
 
-            print(f"[Integration][AsyncCloudflareChallenge] Success! Status: {resp.status_code}")
+            print(
+                f"[Integration][AsyncCloudflareChallenge] Success! Status: {resp.status_code}"
+            )
 
 
 class TestIntegrationTurnstile:
@@ -118,6 +125,8 @@ class TestIntegrationBalance:
             balance = solver.get_balance()
 
             assert balance is not None, "Expected balance to be returned"
-            assert isinstance(balance, (int, float)), f"Expected numeric balance, got {type(balance)}"
+            assert isinstance(
+                balance, (int, float)
+            ), f"Expected numeric balance, got {type(balance)}"
 
             print(f"[Integration][Balance] Current balance: {balance}")

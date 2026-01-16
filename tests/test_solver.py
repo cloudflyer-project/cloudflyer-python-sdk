@@ -24,7 +24,9 @@ class TestSolverInitialization:
 
     def test_init_with_custom_impersonate(self, mock_solver_kwargs):
         """Test solver initialization with custom impersonate."""
-        solver = CloudflareSolver(**mock_solver_kwargs, solve=False, impersonate="firefox")
+        solver = CloudflareSolver(
+            **mock_solver_kwargs, solve=False, impersonate="firefox"
+        )
         assert solver.impersonate == "firefox"
         solver.close()
 
@@ -134,8 +136,7 @@ class TestBasicRequests:
         """Test request with custom headers."""
         with CloudflareSolver(**mock_solver_kwargs, solve=False) as solver:
             resp = solver.get(
-                "https://httpbin.org/headers",
-                headers={"X-Custom-Header": "test-value"}
+                "https://httpbin.org/headers", headers={"X-Custom-Header": "test-value"}
             )
             assert resp.status_code == 200
             headers = resp.json().get("headers", {})
@@ -186,9 +187,7 @@ class TestProxyConfiguration:
     def test_init_with_proxy(self, mock_solver_kwargs):
         """Test solver initialization with proxy."""
         solver = CloudflareSolver(
-            **mock_solver_kwargs,
-            solve=False,
-            proxy="http://proxy.example.com:8080"
+            **mock_solver_kwargs, solve=False, proxy="http://proxy.example.com:8080"
         )
         assert solver.user_proxy == "http://proxy.example.com:8080"
         solver.close()
@@ -199,7 +198,7 @@ class TestProxyConfiguration:
             **mock_solver_kwargs,
             solve=False,
             proxy="http://fast-proxy:8080",
-            api_proxy="http://stable-proxy:8081"
+            api_proxy="http://stable-proxy:8081",
         )
         assert solver.user_proxy == "http://fast-proxy:8080"
         assert solver.api_proxy == "http://stable-proxy:8081"

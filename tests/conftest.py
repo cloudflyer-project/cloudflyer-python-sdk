@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-if sys.platform == 'win32':
+if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 ENV_FILE = Path(__file__).parent / ".env"
@@ -15,7 +15,7 @@ def load_env():
     """Load .env file if exists."""
     if not ENV_FILE.exists():
         return
-    
+
     for line in ENV_FILE.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -40,7 +40,10 @@ def pytest_configure(config):
 
 @pytest.fixture
 def api_url() -> str:
-    return os.environ.get("CLOUDFLYER_API_BASE", os.environ.get("CLOUDFLYER_API_URL", "https://solver.zetx.site")).rstrip("/")
+    return os.environ.get(
+        "CLOUDFLYER_API_BASE",
+        os.environ.get("CLOUDFLYER_API_URL", "https://solver.zetx.site"),
+    ).rstrip("/")
 
 
 @pytest.fixture
