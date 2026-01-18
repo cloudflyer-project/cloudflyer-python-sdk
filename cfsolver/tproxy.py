@@ -15,11 +15,10 @@ import signal
 from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlparse
 
-import httpx
 from mitmproxy import http, options, ctx
 from mitmproxy.tools.dump import DumpMaster
 
-from .client import CloudflareSolver
+from .async_client import AsyncCloudflareSolver
 from .exceptions import CFSolverProxyError
 
 logger = logging.getLogger(__name__)
@@ -133,6 +132,7 @@ class CloudAPIProxyAddon:
         enable_detection: bool = True,
         no_cache: bool = False,
         timeout: int = 120,
+        polling_interval: float = 2.0,
         extra_title_indicators: Optional[list] = None,
         extra_cf_indicators: Optional[list] = None,
     ):
@@ -144,6 +144,7 @@ class CloudAPIProxyAddon:
         self.enable_detection = enable_detection
         self.no_cache = no_cache
         self.timeout = timeout
+        self.polling_interval = polling_interval
 
         self.detector = (
             CloudflareDetector(
@@ -155,34 +156,116 @@ class CloudAPIProxyAddon:
         )
 
         # Host-level locks for serializing challenge solving
-        self.host_locks: Dict[str, threading.Event] = {}
-        self.host_lock = threading.Lock()
+        self.host_locks: Dict[str, asyncio.Event] = {}
+        self.host_lock = asyncio.Lock()
 
         # Store cf_clearance cookies keyed by host and User-Agent
         # Structure: {host: {user_agent: cf_clearance}}
         self.cf_clearance_store: Dict[str, Dict[str, str]] = {}
         self._store_lock = threading.Lock()
 
-        # Pre-start CloudflareSolver with pywssocks provider
-        # This establishes the linksocks tunnel for server to access user's network
-        self._solver: Optional[CloudflareSolver] = None
-        if enable_detection:
+        # Lazy async solver (created on first use inside async response handler)
+        self._solver: Optional[AsyncCloudflareSolver] = None
+
+    def _get_or_create_solver(self) -> AsyncCloudflareSolver:
+        if self._solver is None:
+            self._solver = AsyncCloudflareSolver(
+                api_key=self.api_key,
+                api_base=self.api_base,
+                proxy=self.user_proxy,
+                api_proxy=self.api_proxy,
+                impersonate=self.impersonate,
+                solve=True,
+                on_challenge=True,
+                use_cache=not self.no_cache,
+                polling_interval=self.polling_interval,
+            )
+        return self._solver
+
+    @staticmethod
+    def _remove_hop_by_hop_headers(headers: Dict[str, str]) -> None:
+        for h in [
+            "Host",
+            "Connection",
+            "Proxy-Connection",
+            "Keep-Alive",
+            "Transfer-Encoding",
+            "TE",
+            "Trailer",
+            "Upgrade",
+        ]:
+            headers.pop(h, None)
+
+    async def _fetch_via_solver(
+        self,
+        flow: http.HTTPFlow,
+        url: str,
+        *,
+        solve: bool,
+        user_agent: Optional[str] = None,
+        cf_clearance: Optional[str] = None,
+    ) -> Optional[http.Response]:
+        """Fetch URL using AsyncCloudflareSolver and return mitmproxy Response."""
+        try:
+            solver = self._get_or_create_solver()
+
+            headers = dict(flow.request.headers)
+            if user_agent:
+                headers["User-Agent"] = user_agent
+
+            if cf_clearance:
+                # Ensure cf_clearance is present for this fetch
+                cookie_val = headers.get("Cookie", "")
+                cookie_parts = [
+                    p.strip()
+                    for p in cookie_val.split(";")
+                    if p.strip() and not p.strip().lower().startswith("cf_clearance=")
+                ]
+                cookie_parts.append(f"cf_clearance={cf_clearance}")
+                headers["Cookie"] = "; ".join(cookie_parts)
+
+            self._remove_hop_by_hop_headers(headers)
+
+            resp = await solver.request(
+                flow.request.method,
+                url,
+                headers=headers,
+                data=flow.request.content or None,
+                solve=solve,
+                on_challenge=True,
+                use_cache=not self.no_cache,
+            )
+
+            return http.Response.make(resp.status_code, resp.content, dict(resp.headers))
+        except Exception as e:
+            logger.error(f"Failed to fetch {url} via solver: {e}")
+            return None
+
+    async def _try_extract_clearance_from_solver(self, url: str) -> Tuple[Optional[str], Optional[str]]:
+        """Best-effort extract (user_agent, cf_clearance) from solver session state."""
+        solver = self._solver
+        if solver is None:
+            return None, None
+
+        user_agent: Optional[str] = None
+        cf_clearance: Optional[str] = None
+
+        try:
+            session = await solver._get_session()  # internal but stable in this SDK
             try:
-                self._solver = CloudflareSolver(
-                    api_key=api_key,
-                    api_base=api_base,
-                    proxy=user_proxy,
-                    api_proxy=api_proxy,
-                    impersonate=impersonate,
-                    solve=True,
-                    on_challenge=False,
-                )
-                # Pre-connect to establish linksocks tunnel
-                self._solver._connect()
-                logger.info("CloudflareSolver initialized with linksocks tunnel")
-            except Exception as e:
-                logger.warning(f"Failed to initialize CloudflareSolver: {e}")
-                self._solver = None
+                user_agent = session.headers.get("User-Agent")
+            except Exception:
+                user_agent = None
+
+            try:
+                # curl_cffi cookie jar is dict-like
+                cf_clearance = session.cookies.get("cf_clearance")
+            except Exception:
+                cf_clearance = None
+        except Exception:
+            return None, None
+
+        return user_agent, cf_clearance
 
     @staticmethod
     def inject_cookie(flow: http.HTTPFlow, cookie_name: str, cookie_value: str) -> None:
@@ -286,32 +369,31 @@ class CloudAPIProxyAddon:
             if self.no_cache:
                 is_solver = True
             else:
-                with self.host_lock:
+                async with self.host_lock:
                     if host not in self.host_locks:
-                        self.host_locks[host] = threading.Event()
+                        self.host_locks[host] = asyncio.Event()
                         is_solver = True
 
             url = flow.request.pretty_url
             try:
-                loop = asyncio.get_running_loop()
-
                 if not is_solver:
                     event = self.host_locks.get(host)
                     if event:
-                        await loop.run_in_executor(None, event.wait, 120.0)
+                        try:
+                            await asyncio.wait_for(event.wait(), timeout=float(self.timeout))
+                        except asyncio.TimeoutError:
+                            return
 
                     # After waiting, get stored cf_clearance and re-fetch
                     stored = self.get_cf_clearance_for_host(host)
                     if stored:
                         stored_ua, stored_cf = stored
-                        # Re-fetch the URL with the solved cookies
-                        refetch_result = await loop.run_in_executor(
-                            None,
-                            self._refetch_with_cookies,
-                            url,
-                            stored_cf,
-                            stored_ua,
+                        refetch_result = await self._fetch_via_solver(
                             flow,
+                            url,
+                            solve=False,
+                            user_agent=stored_ua,
+                            cf_clearance=stored_cf,
                         )
                         if refetch_result:
                             flow.response = refetch_result
@@ -325,72 +407,24 @@ class CloudAPIProxyAddon:
                     f"Detected Cloudflare challenge for {url}, solving via cloud API..."
                 )
 
-                # Solve challenge using cloud API
-                result = await loop.run_in_executor(None, self._solve_challenge, url)
+                solved_response = await self._fetch_via_solver(flow, url, solve=True)
+                if not solved_response:
+                    logger.error("Challenge solve failed: solver fetch returned no response")
+                    return
 
-                if result and result.get("success"):
-                    solution = result.get("solution", {})
-                    cookies = solution.get("cookies", {})
-                    headers = solution.get("headers", {})
-                    user_agent = headers.get("User-Agent")
-                    cf_clearance = cookies.get("cf_clearance")
+                flow.response = solved_response
 
-                    # Persist cf_clearance for future first-send usage when available
-                    if not self.no_cache and user_agent and cf_clearance:
-                        self.set_cf_clearance(host, user_agent, cf_clearance)
+                # Persist cf_clearance for future first-send usage when available
+                if not self.no_cache:
+                    ua, cf = await self._try_extract_clearance_from_solver(url)
+                    if ua and cf:
+                        self.set_cf_clearance(host, ua, cf)
                         logger.info(f"[Cache STORE] Stored cf_clearance for {host}")
                     else:
                         logger.warning(
-                            f"[Cache SKIP] user_agent={bool(user_agent)}, cf_clearance={bool(cf_clearance)}"
+                            f"[Cache SKIP] user_agent={bool(ua)}, cf_clearance={bool(cf)}"
                         )
-
-                    # Check if we have response content - if so, return it directly
-                    response_data = solution.get("response")
-                    if response_data and isinstance(response_data, dict):
-                        resp_headers = response_data.get("headers", {})
-                        resp_status = response_data.get("status_code", 200)
-                        resp_content = response_data.get("content", "")
-
-                        # Directly replace the response, no replay needed
-                        flow.response = http.Response.make(
-                            resp_status,
-                            (
-                                resp_content.encode("utf-8")
-                                if isinstance(resp_content, str)
-                                else resp_content
-                            ),
-                            resp_headers,
-                        )
-                        logger.info(f"Challenge solved, returning response directly")
-                        return
-
-                    # No response content from solver, re-fetch with cookies/UA
-                    if cf_clearance:
-                        refetch_result = await loop.run_in_executor(
-                            None,
-                            self._refetch_with_cookies,
-                            url,
-                            cf_clearance,
-                            user_agent,
-                            flow,
-                        )
-                        if refetch_result:
-                            flow.response = refetch_result
-                            logger.info(
-                                f"Challenge solved, re-fetched content successfully"
-                            )
-                            return
-
-                    logger.warning(
-                        f"Challenge solved but no cf_clearance cookie received"
-                    )
-                else:
-                    error = (
-                        result.get("error", "Unknown error")
-                        if result
-                        else "No response"
-                    )
-                    logger.error(f"Challenge solve failed: {error}")
+                return
 
             except Exception as e:
                 logger.error(f"Error resolving challenge for {url}: {e}")
@@ -398,215 +432,10 @@ class CloudAPIProxyAddon:
                 # Only release lock if we acquired one (i.e., not in no_cache mode)
                 # Ensure lock is always released even if exceptions occur before try block
                 if not self.no_cache and is_solver:
-                    with self.host_lock:
+                    async with self.host_lock:
                         if host in self.host_locks:
                             self.host_locks[host].set()
                             del self.host_locks[host]
-
-    def _refetch_with_cookies(
-        self,
-        url: str,
-        cf_clearance: str,
-        user_agent: Optional[str],
-        flow: http.HTTPFlow,
-    ) -> Optional[http.Response]:
-        """Re-fetch URL with cf_clearance cookie and return mitmproxy Response."""
-        try:
-            # Build headers from original request
-            headers = dict(flow.request.headers)
-            if user_agent:
-                headers["User-Agent"] = user_agent
-
-            # Build cookies
-            original_cookie = headers.get("Cookie", "")
-            cookie_parts = [
-                p.strip()
-                for p in original_cookie.split(";")
-                if p.strip() and not p.strip().lower().startswith("cf_clearance=")
-            ]
-            cookie_parts.append(f"cf_clearance={cf_clearance}")
-            headers["Cookie"] = "; ".join(cookie_parts)
-
-            # Remove hop-by-hop headers that shouldn't be forwarded
-            for h in [
-                "Host",
-                "Connection",
-                "Proxy-Connection",
-                "Keep-Alive",
-                "Transfer-Encoding",
-                "TE",
-                "Trailer",
-                "Upgrade",
-            ]:
-                headers.pop(h, None)
-
-            # Determine proxy for httpx
-            proxies = None
-            if self.user_proxy:
-                proxies = {"http://": self.user_proxy, "https://": self.user_proxy}
-
-            # Make the request
-            with httpx.Client(
-                proxies=proxies, verify=False, timeout=30.0, follow_redirects=True
-            ) as client:
-                method = flow.request.method
-                content = flow.request.content
-
-                resp = client.request(method, url, headers=headers, content=content)
-
-                # Convert to mitmproxy Response
-                resp_headers = dict(resp.headers)
-                return http.Response.make(resp.status_code, resp.content, resp_headers)
-        except Exception as e:
-            logger.error(f"Failed to re-fetch {url}: {e}")
-            return None
-
-    def _solve_challenge(self, url: str) -> Dict[str, Any]:
-        """Solve Cloudflare challenge and return response content directly."""
-        if not self._solver:
-            # Fallback: try to create solver on demand
-            try:
-                self._solver = CloudflareSolver(
-                    api_key=self.api_key,
-                    api_base=self.api_base,
-                    proxy=self.user_proxy,
-                    api_proxy=self.api_proxy,
-                    impersonate=self.impersonate,
-                    solve=True,
-                    on_challenge=False,
-                )
-                self._solver._connect()
-            except Exception as e:
-                return {"success": False, "error": f"Failed to initialize solver: {e}"}
-
-        try:
-            # Ensure linksocks tunnel is connected
-            self._solver._connect()
-
-            if not self._solver._linksocks_config:
-                return {
-                    "success": False,
-                    "error": "CloudFlyer service unavailable: connection failed",
-                }
-
-            # Call API directly with response=True to get page content
-            with httpx.Client(
-                verify=False, proxy=self.api_proxy, timeout=30.0
-            ) as api_client:
-                resp = api_client.post(
-                    f"{self.api_base}/api/createTask",
-                    json={
-                        "apiKey": self.api_key,
-                        "task": {
-                            "type": "CloudflareTask",
-                            "websiteURL": url,
-                            "response": True,  # Request response content
-                            "linksocks": {
-                                "url": self._solver._linksocks_config["url"],
-                                "token": self._solver._linksocks_config[
-                                    "connector_token"
-                                ],
-                            },
-                        },
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
-
-            if data.get("errorId"):
-                return {
-                    "success": False,
-                    "error": data.get("errorDescription", "Unknown error"),
-                }
-
-            task_id = data["taskId"]
-            logger.debug(f"Task created: {task_id}")
-
-            # Wait for result
-            result = self._wait_for_task_result(task_id)
-            if not result:
-                return {"success": False, "error": "Task timed out"}
-
-            # Extract solution from worker result
-            worker_result = result.get("result") or {}
-            if isinstance(worker_result.get("result"), dict):
-                solution = worker_result["result"]
-            else:
-                solution = worker_result
-
-            if not isinstance(solution, dict):
-                return {"success": False, "error": "Invalid response from server"}
-
-            cookies = solution.get("cookies", {})
-            user_agent = solution.get("userAgent")
-            headers = solution.get("headers", {})
-            if not user_agent and isinstance(headers, dict):
-                user_agent = headers.get("User-Agent")
-
-            # Build response data if available
-            response_data = None
-            if solution.get("response"):
-                resp_info = solution["response"]
-                response_data = {
-                    "status_code": resp_info.get(
-                        "status_code", resp_info.get("statusCode", 200)
-                    ),
-                    "headers": resp_info.get("headers", {}),
-                    "content": resp_info.get("content", resp_info.get("text", "")),
-                }
-
-            result_solution = {
-                "cookies": cookies,
-                "headers": {"User-Agent": user_agent} if user_agent else {},
-            }
-            if response_data:
-                result_solution["response"] = response_data
-
-            logger.info("Challenge solved successfully via CloudflareSolver")
-            return {"success": True, "solution": result_solution}
-
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    def _wait_for_task_result(
-        self, task_id: str, timeout: int = 120
-    ) -> Optional[Dict[str, Any]]:
-        """Wait for task result using long-polling."""
-        start = time.time()
-
-        with httpx.Client(verify=False, proxy=self.api_proxy, timeout=130.0) as client:
-            while time.time() - start < timeout:
-                try:
-                    res = client.post(
-                        f"{self.api_base}/api/waitTaskResult",
-                        json={"apiKey": self.api_key, "taskId": task_id},
-                    )
-
-                    if res.status_code != 200:
-                        time.sleep(2)
-                        continue
-
-                    result = res.json()
-                    status = result.get("status")
-
-                    if status == "processing" or status == "timeout":
-                        continue
-
-                    success = result.get("success")
-                    if isinstance(success, bool) and success:
-                        return result
-                    if status in ("completed", "ready") and not result.get("error"):
-                        return result
-
-                    # Task failed
-                    logger.error(f"Task failed: {result.get('error', 'Unknown error')}")
-                    return None
-
-                except Exception as e:
-                    logger.debug(f"Poll error: {e}")
-                    time.sleep(2)
-
-        return None
 
     # --- cf_clearance store helpers ---
     def set_cf_clearance(self, host: str, user_agent: str, cf_clearance: str) -> None:
