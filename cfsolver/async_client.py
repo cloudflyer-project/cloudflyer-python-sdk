@@ -113,9 +113,10 @@ class AsyncCloudflareSolver:
         impersonate: Browser to impersonate (default: "chrome")
         use_polling: Use interval polling instead of long-polling (default: False).
             When False, uses /waitTaskResult for efficient long-polling.
-            When True, uses /getTaskResult with 2-second intervals.
+            When True, uses /getTaskResult with configurable intervals.
         use_cache: Cache clearance data per host to avoid redundant solves (default: True).
             Cached data includes cookies, user agent, and TLS fingerprints.
+        polling_interval: Interval in seconds between polling attempts when use_polling=True (default: 2.0)
 
     Examples:
         >>> async with AsyncCloudflareSolver("your_api_key") as solver:
@@ -134,6 +135,7 @@ class AsyncCloudflareSolver:
         impersonate: str = "chrome",
         use_polling: bool = False,
         use_cache: bool = True,
+        polling_interval: float = 2.0,
     ):
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
@@ -144,10 +146,13 @@ class AsyncCloudflareSolver:
         self.impersonate = impersonate
         self.use_polling = use_polling
         self.use_cache = use_cache
+        self.polling_interval = polling_interval
 
         self._client: Optional[WSSocksClient] = None
         self._client_task: Optional[asyncio.Task] = None
         self._linksocks_config: Optional[Dict[str, Any]] = None
+        self._client_ready = asyncio.Event()
+        self._client_failed = asyncio.Event()
 
         # Session state (lazy initialization)
         self._session: Optional[AsyncSession] = None
@@ -238,9 +243,19 @@ class AsyncCloudflareSolver:
             config["url"] = self._normalize_ws_url(config["url"])
         return config
 
-    async def _connect(self):
+    async def _connect(self, timeout: float = 10.0):
+        """Establish connection to LinkSocks service.
+        
+        Args:
+            timeout: Maximum time to wait for connection in seconds
+        """
         if self._client_task and not self._client_task.done():
             return
+
+        # Clear connection state
+        self._client_ready.clear()
+        self._client_failed.clear()
+
         try:
             self._linksocks_config = await self._get_linksocks_config()
 
@@ -258,15 +273,51 @@ class AsyncCloudflareSolver:
                 upstream_password=upstream_password,
                 upstream_proxy_type=upstream_type,
             )
-            self._client_task = await self._client.wait_ready(timeout=10)
+            self._client_task = await self._client.wait_ready(timeout=timeout)
+            
+            # Set ready flag after wait_ready completes
+            self._client_ready.set()
             logger.info("LinkSocks Provider established")
         except Exception as e:
             logger.error(f"Connection setup failed: {e}")
             self._last_connect_error = str(e)
+            self._client_failed.set()
             if self.solve and not self.on_challenge:
                 raise CFSolverConnectionError(
                     f"Failed to connect to CloudFlyer service: {e}"
                 )
+
+    def is_connected(self) -> bool:
+        """Check if currently connected to LinkSocks service.
+        
+        Returns:
+            True if connected and ready, False otherwise
+        """
+        return (
+            self._client is not None
+            and self._client_task is not None
+            and not self._client_task.done()
+            and self._client_ready.is_set()
+            and not self._client_failed.is_set()
+        )
+
+    async def ensure_connected(self, timeout: float = 10.0) -> bool:
+        """Manually establish connection to LinkSocks before first solve.
+        
+        This can be used to pre-connect and reduce latency on the first solve.
+        
+        Args:
+            timeout: Maximum time to wait for connection in seconds
+            
+        Returns:
+            True if connection successful, False otherwise
+        """
+        try:
+            await self._connect(timeout=timeout)
+            return self.is_connected()
+        except Exception as e:
+            logger.error(f"Failed to ensure connection: {e}")
+            return False
 
     def _detect_challenge(self, resp: Response) -> bool:
         if resp.status_code not in (403, 503):
@@ -476,7 +527,7 @@ class AsyncCloudflareSolver:
 
             if res.status_code != 200:
                 if self.use_polling:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(self.polling_interval)
                 continue
 
             result = res.json()
@@ -485,7 +536,7 @@ class AsyncCloudflareSolver:
             # Still processing - wait and retry
             if status == "processing":
                 if self.use_polling:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(self.polling_interval)
                 continue
 
             # Check for timeout status from waitTaskResult
