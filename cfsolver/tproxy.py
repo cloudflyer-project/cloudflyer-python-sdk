@@ -236,12 +236,16 @@ class CloudAPIProxyAddon:
                 use_cache=not self.no_cache,
             )
 
-            return http.Response.make(resp.status_code, resp.content, dict(resp.headers))
+            return http.Response.make(
+                resp.status_code, resp.content, dict(resp.headers)
+            )
         except Exception as e:
             logger.error(f"Failed to fetch {url} via solver: {e}")
             return None
 
-    async def _try_extract_clearance_from_solver(self, url: str) -> Tuple[Optional[str], Optional[str]]:
+    async def _try_extract_clearance_from_solver(
+        self, url: str
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Best-effort extract (user_agent, cf_clearance) from solver session state."""
         solver = self._solver
         if solver is None:
@@ -380,7 +384,9 @@ class CloudAPIProxyAddon:
                     event = self.host_locks.get(host)
                     if event:
                         try:
-                            await asyncio.wait_for(event.wait(), timeout=float(self.timeout))
+                            await asyncio.wait_for(
+                                event.wait(), timeout=float(self.timeout)
+                            )
                         except asyncio.TimeoutError:
                             return
 
@@ -409,7 +415,9 @@ class CloudAPIProxyAddon:
 
                 solved_response = await self._fetch_via_solver(flow, url, solve=True)
                 if not solved_response:
-                    logger.error("Challenge solve failed: solver fetch returned no response")
+                    logger.error(
+                        "Challenge solve failed: solver fetch returned no response"
+                    )
                     return
 
                 flow.response = solved_response

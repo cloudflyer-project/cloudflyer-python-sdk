@@ -245,7 +245,7 @@ class AsyncCloudflareSolver:
 
     async def _connect(self, timeout: float = 10.0):
         """Establish connection to LinkSocks service.
-        
+
         Args:
             timeout: Maximum time to wait for connection in seconds
         """
@@ -274,7 +274,7 @@ class AsyncCloudflareSolver:
                 upstream_proxy_type=upstream_type,
             )
             self._client_task = await self._client.wait_ready(timeout=timeout)
-            
+
             # Set ready flag after wait_ready completes
             self._client_ready.set()
             logger.info("LinkSocks Provider established")
@@ -289,7 +289,7 @@ class AsyncCloudflareSolver:
 
     def is_connected(self) -> bool:
         """Check if currently connected to LinkSocks service.
-        
+
         Returns:
             True if connected and ready, False otherwise
         """
@@ -303,12 +303,12 @@ class AsyncCloudflareSolver:
 
     async def ensure_connected(self, timeout: float = 10.0) -> bool:
         """Manually establish connection to LinkSocks before first solve.
-        
+
         This can be used to pre-connect and reduce latency on the first solve.
-        
+
         Args:
             timeout: Maximum time to wait for connection in seconds
-            
+
         Returns:
             True if connection successful, False otherwise
         """

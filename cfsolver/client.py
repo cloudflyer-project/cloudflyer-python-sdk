@@ -252,7 +252,7 @@ class CloudflareSolver:
 
     def _connect(self, timeout: float = 10.0):
         """Connect to LinkSocks server.
-        
+
         Args:
             timeout: Maximum time to wait for connection (default: 10 seconds)
         """
@@ -299,7 +299,9 @@ class CloudflareSolver:
             if self._client_ready.wait(timeout=timeout):
                 logger.info("LinkSocks provider established")
             else:
-                logger.warning(f"LinkSocks connection timeout after {timeout}s, proceeding anyway")
+                logger.warning(
+                    f"LinkSocks connection timeout after {timeout}s, proceeding anyway"
+                )
 
         except Exception as e:
             logger.error(f"Connection setup failed: {e}")
@@ -311,7 +313,7 @@ class CloudflareSolver:
 
     def is_connected(self) -> bool:
         """Check if LinkSocks client is currently connected.
-        
+
         Returns:
             True if connected, False otherwise
         """
@@ -319,16 +321,16 @@ class CloudflareSolver:
 
     def ensure_connected(self, timeout: float = 10.0) -> bool:
         """Ensure LinkSocks connection is established before solving challenges.
-        
+
         This method can be called manually before the first solve to establish
         the connection in advance, reducing latency on the first challenge.
-        
+
         Args:
             timeout: Maximum time to wait for connection (default: 10 seconds)
-            
+
         Returns:
             True if connected successfully, False otherwise
-            
+
         Example:
             >>> solver = CloudflareSolver("your_api_key")
             >>> if solver.ensure_connected():
