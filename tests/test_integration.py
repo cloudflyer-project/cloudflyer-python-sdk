@@ -13,7 +13,6 @@ import pytest
 
 from cfsolver import AsyncCloudflareSolver, CloudflareSolver
 
-
 pytestmark = pytest.mark.integration
 
 

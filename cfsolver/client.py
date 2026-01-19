@@ -37,7 +37,6 @@ from .exceptions import (
     CFSolverConnectionError,
 )
 
-
 logger = logging.getLogger(__name__)
 
 # Global cache for clearance data (shared across instances)
