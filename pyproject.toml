@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cfsolver"
-version = "1.0.1"
+version = "1.0.2"
 description = "Cloudflare Solver - HTTP client with automatic challenge bypass"
 readme = "README.md"
 authors = [
