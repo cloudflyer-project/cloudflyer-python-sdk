@@ -224,7 +224,7 @@ class AsyncCloudflareSolver:
         return url
 
     async def _get_linksocks_config(self) -> Dict[str, Any]:
-        url = f"{self.api_base}/api/linksocks/getLinkSocks"
+        url = f"{self.api_base}/getLinkSocks"
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         resp = await self._api_client.post(url, headers=headers)
         if resp.status_code != 200:

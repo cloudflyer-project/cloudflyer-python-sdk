@@ -223,7 +223,7 @@ class CloudflareSolver:
         return url
 
     def _get_linksocks_config(self) -> Dict[str, Any]:
-        url = f"{self.api_base}/api/linksocks/getLinkSocks"
+        url = f"{self.api_base}/getLinkSocks"
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         with Session(verify=False, proxy=self.api_proxy) as s:
             resp = s.post(url, headers=headers)
