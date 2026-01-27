@@ -129,10 +129,13 @@ def solve_cloudflare(
                     click.echo(f"    User-Agent: {result['user_agent']}")
 
     except Exception as e:
+        err_text = str(e)
+        if err_text.isdigit():
+            err_text = f"{type(e).__name__}: {e!r}"
         if output_json:
-            click.echo(json.dumps({"success": False, "error": str(e)}, indent=2))
+            click.echo(json.dumps({"success": False, "error": err_text}, indent=2))
         else:
-            click.echo(f"[x] Error: {e}", err=True)
+            click.echo(f"[x] Error: {err_text}", err=True)
         sys.exit(1)
 
 

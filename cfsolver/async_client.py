@@ -32,6 +32,8 @@ from urllib.parse import urlparse, unquote
 from curl_cffi.requests import AsyncSession, Response
 from pywssocks import WSSocksClient
 
+from .tls_utils import is_fingerprint_incompatibility_error, sanitize_ja3
+
 from .exceptions import (
     CFSolverError,
     CFSolverAPIError,
@@ -208,7 +210,17 @@ class AsyncCloudflareSolver:
         self._ja3 = ja3
         self._akamai = akamai
 
-        session = await self._get_session()
+        try:
+            session = await self._get_session()
+        except Exception as e:
+            logger.info(
+                "Failed to apply TLS fingerprints (%s); falling back to impersonate=%s",
+                str(e),
+                self.impersonate,
+            )
+            self._ja3 = None
+            self._akamai = None
+            session = await self._get_session()
         for k, v in old_cookies.items():
             session.cookies.set(k, v)
         for k, v in old_headers.items():
@@ -347,7 +359,7 @@ class AsyncCloudflareSolver:
             logger.debug(f"Loading clearance from cache for {cache_key}")
 
             # Apply cached TLS fingerprints
-            ja3 = cached.get("ja3")
+            ja3 = sanitize_ja3(cached.get("ja3"))
             akamai = cached.get("akamai")
             if ja3 or akamai:
                 await self._reset_session(ja3=ja3, akamai=akamai)
@@ -465,7 +477,7 @@ class AsyncCloudflareSolver:
                 user_agent = headers.get("User-Agent")
 
             # Apply TLS fingerprints if provided
-            ja3_text = solution.get("ja3_text")
+            ja3_text = sanitize_ja3(solution.get("ja3_text"))
             akamai_text = solution.get("akamai_text")
             if ja3_text or akamai_text:
                 logger.debug(
@@ -659,8 +671,25 @@ class AsyncCloudflareSolver:
 
         session = await self._get_session()
 
+        async def _request_with_fallback() -> Response:
+            nonlocal session
+            try:
+                return await session.request(method, url, **kwargs)
+            except Exception as e:
+                if not (self._ja3 or self._akamai):
+                    raise
+
+                logger.info(
+                    "Request failed with TLS fingerprints (%s); retrying with impersonate=%s",
+                    str(e),
+                    self.impersonate,
+                )
+                await self._reset_session(ja3=None, akamai=None)
+                session = await self._get_session()
+                return await session.request(method, url, **kwargs)
+
         if not _solve:
-            return await session.request(method, url, **kwargs)
+            return await _request_with_fallback()
 
         if not _on_challenge:
             # Always pre-solve
@@ -670,13 +699,13 @@ class AsyncCloudflareSolver:
             except Exception as e:
                 logger.warning(f"Pre-solve failed: {e}")
 
-        resp = await session.request(method, url, **kwargs)
+        resp = await _request_with_fallback()
 
         if _on_challenge and self._detect_challenge(resp):
             logger.info("Cloudflare challenge detected")
             await self._solve_challenge(url, resp.text, use_cache=_use_cache)
             session = await self._get_session()
-            resp = await session.request(method, url, **kwargs)
+            resp = await _request_with_fallback()
 
         return resp
 
@@ -808,8 +837,15 @@ class AsyncCloudflareSolver:
 
     async def aclose(self):
         if self._session:
-            await self._session.close()
-            self._session = None
+            try:
+                await self._session.close()
+            except Exception as e:
+                if is_fingerprint_incompatibility_error(e):
+                    logger.info("Ignoring aclose() error: %s", str(e))
+                else:
+                    raise
+            finally:
+                self._session = None
         await self._api_client.close()
 
         if self._client_task and not self._client_task.done():
