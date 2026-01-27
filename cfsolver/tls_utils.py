@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-
 _CIPHER_NOT_FOUND_RE = re.compile(r"Cipher\s+0x([0-9a-fA-F]+)\s+is\s+not\s+found")
 _EXTENSION_TOGGLE_RE = re.compile(
     r"extension\((\d+)\)\s+can\s+not\s+be\s+toggled",
