@@ -25,6 +25,7 @@ Copyright (c) 2024 CloudFlyer Team. MIT License.
 
 import asyncio
 import logging
+import os
 import time
 from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlparse, unquote
@@ -107,7 +108,7 @@ class AsyncCloudflareSolver:
 
     Args:
         api_key: Your API key
-        api_base: CloudFlyer service URL (default: https://solver.zetx.site)
+        api_base: CloudFlyer service URL (default: $CLOUDFLYER_API_BASE or https://solver.zetx.site)
         solve: Enable automatic challenge solving (default: True)
         on_challenge: Solve only when challenge detected (default: True)
         proxy: HTTP proxy for your requests (optional)
@@ -129,7 +130,7 @@ class AsyncCloudflareSolver:
     def __init__(
         self,
         api_key: str,
-        api_base: str = "https://solver.zetx.site",
+        api_base: Optional[str] = None,
         solve: bool = True,
         on_challenge: bool = True,
         proxy: Optional[str] = None,
@@ -140,7 +141,7 @@ class AsyncCloudflareSolver:
         polling_interval: float = 2.0,
     ):
         self.api_key = api_key
-        self.api_base = api_base.rstrip("/")
+        self.api_base = (api_base or os.environ.get("CLOUDFLYER_API_BASE") or "https://solver.zetx.site").rstrip("/")
         self.solve = solve
         self.on_challenge = on_challenge
         self.user_proxy = proxy
