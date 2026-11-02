@@ -7,6 +7,8 @@ initialization, and challenge detection logic.
 Run with: pytest tests/test_solver.py -v
 """
 
+import importlib.util
+
 import pytest
 
 from cfsolver import AsyncCloudflareSolver, CloudflareSolver
@@ -272,20 +274,8 @@ class TestDetectionRules:
         assert result.kind == NONE
 
 
-class TestClearanceCacheGating:
-    """Only a cleared page may seed the clearance caches."""
-
-    @staticmethod
-    def _flow(url="https://example.com/protected"):
-        from types import SimpleNamespace
-        from mitmproxy import http
-
-        return SimpleNamespace(
-            request=http.Request.make("GET", url, headers={"User-Agent": "test-agent"}),
-            response=http.Response.make(
-                403, b"Just a moment...", {"Server": "cloudflare"}
-            ),
-        )
+class TestClearanceCache:
+    """Empty solves must not enter the solver clearance cache."""
 
     def test_empty_solution_is_not_saved(self, mock_solver_kwargs):
         solver = CloudflareSolver(**mock_solver_kwargs, solve=False)
@@ -302,6 +292,26 @@ class TestClearanceCacheGating:
             await AsyncCloudflareSolver.clear_cache()
             await solver._save_to_cache("https://example.com", {}, None, None, None)
             assert await solver._load_from_cache("https://example.com") is False
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("mitmproxy") is None,
+    reason="mitmproxy is only installed with cfsolver[proxy]",
+)
+class TestProxyClearanceCache:
+    """Only a cleared page may seed the proxy clearance store."""
+
+    @staticmethod
+    def _flow(url="https://example.com/protected"):
+        from types import SimpleNamespace
+        from mitmproxy import http
+
+        return SimpleNamespace(
+            request=http.Request.make("GET", url, headers={"User-Agent": "test-agent"}),
+            response=http.Response.make(
+                403, b"Just a moment...", {"Server": "cloudflare"}
+            ),
+        )
 
     @pytest.mark.asyncio
     async def test_error_response_does_not_store_clearance(self):
