@@ -143,7 +143,11 @@ class AsyncCloudflareSolver:
         challenge_markers: Optional[Iterable[str]] = None,
     ):
         self.api_key = api_key
-        self.api_base = (api_base or os.environ.get("CLOUDFLYER_API_BASE") or "https://solver.zetx.site").rstrip("/")
+        self.api_base = (
+            api_base
+            or os.environ.get("CLOUDFLYER_API_BASE")
+            or "https://solver.zetx.site"
+        ).rstrip("/")
         self.solve = solve
         self.on_challenge = on_challenge
         self.user_proxy = proxy
