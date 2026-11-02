@@ -25,6 +25,13 @@ from .exceptions import CFSolverProxyError
 logger = logging.getLogger(__name__)
 
 
+def _is_cleared_response(response: http.Response) -> bool:
+    """A solved response may only seed the cache when the challenge is gone."""
+    if not 200 <= response.status_code < 400:
+        return False
+    return not detect_challenge(response)
+
+
 class CloudflareDetector:
     """Cloudflare challenge detection logic."""
 
@@ -374,8 +381,17 @@ class CloudAPIProxyAddon:
 
                 flow.response = solved_response
 
-                # Persist cf_clearance for future first-send usage when available
+                # Persist cf_clearance for future first-send usage when available.
+                # An unusable solve (error status or a page that is still a
+                # challenge) must not seed the cache, or every later request
+                # gets a clearance that was never accepted.
                 if not self.no_cache:
+                    if not _is_cleared_response(solved_response):
+                        logger.warning(
+                            f"[Cache SKIP] Solve did not clear {host}: "
+                            f"HTTP {solved_response.status_code}"
+                        )
+                        return
                     ua, cf = await self._try_extract_clearance_from_solver(url)
                     if ua and cf:
                         self.set_cf_clearance(host, ua, cf)

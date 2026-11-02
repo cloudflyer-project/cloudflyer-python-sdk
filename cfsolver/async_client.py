@@ -356,7 +356,7 @@ class AsyncCloudflareSolver:
         cache_key = self._get_cache_key(url)
         async with _clearance_cache_lock:
             cached = _clearance_cache.get(cache_key)
-            if not cached:
+            if not cached or not cached.get("cookies"):
                 return False
 
             logger.debug(f"Loading clearance from cache for {cache_key}")
@@ -391,6 +391,11 @@ class AsyncCloudflareSolver:
             return
 
         cache_key = self._get_cache_key(url)
+        if not cookies:
+            # A solve without cookies carries no clearance; caching it would
+            # make later requests believe they were already cleared.
+            logger.debug(f"Skipped caching empty clearance for {cache_key}")
+            return
         async with _clearance_cache_lock:
             _clearance_cache[cache_key] = {
                 "cookies": cookies,

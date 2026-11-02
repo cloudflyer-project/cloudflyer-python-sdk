@@ -272,6 +272,103 @@ class TestDetectionRules:
         assert result.kind == NONE
 
 
+class TestClearanceCacheGating:
+    """Only a cleared page may seed the clearance caches."""
+
+    @staticmethod
+    def _flow(url="https://example.com/protected"):
+        from types import SimpleNamespace
+        from mitmproxy import http
+
+        return SimpleNamespace(
+            request=http.Request.make("GET", url, headers={"User-Agent": "test-agent"}),
+            response=http.Response.make(
+                403, b"Just a moment...", {"Server": "cloudflare"}
+            ),
+        )
+
+    def test_empty_solution_is_not_saved(self, mock_solver_kwargs):
+        solver = CloudflareSolver(**mock_solver_kwargs, solve=False)
+        CloudflareSolver.clear_cache()
+        solver._save_to_cache("https://example.com", {}, None, None, None)
+        assert solver._load_from_cache("https://example.com") is False
+        solver.close()
+
+    @pytest.mark.asyncio
+    async def test_empty_solution_is_not_saved_in_async_solver(
+        self, mock_solver_kwargs
+    ):
+        async with AsyncCloudflareSolver(**mock_solver_kwargs, solve=False) as solver:
+            await AsyncCloudflareSolver.clear_cache()
+            await solver._save_to_cache("https://example.com", {}, None, None, None)
+            assert await solver._load_from_cache("https://example.com") is False
+
+    @pytest.mark.asyncio
+    async def test_error_response_does_not_store_clearance(self):
+        from unittest.mock import AsyncMock
+        from mitmproxy import http
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key")
+        flow = self._flow()
+        addon._fetch_via_solver = AsyncMock(
+            return_value=http.Response.make(
+                403, b"Just a moment...", {"Server": "cloudflare"}
+            )
+        )
+        addon._try_extract_clearance_from_solver = AsyncMock(
+            return_value=("test-agent", "stale-clearance")
+        )
+
+        await addon.response(flow)
+
+        assert flow.response.status_code == 403
+        assert addon.get_cf_clearance("example.com", "test-agent") is None
+
+    @pytest.mark.asyncio
+    async def test_cleared_response_stores_clearance(self):
+        from unittest.mock import AsyncMock
+        from mitmproxy import http
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key")
+        flow = self._flow()
+        addon._fetch_via_solver = AsyncMock(
+            return_value=http.Response.make(
+                200, b"<html>article</html>", {"Content-Type": "text/html"}
+            )
+        )
+        addon._try_extract_clearance_from_solver = AsyncMock(
+            return_value=("test-agent", "fresh-clearance")
+        )
+
+        await addon.response(flow)
+
+        assert addon.get_cf_clearance("example.com", "test-agent") == "fresh-clearance"
+
+    @pytest.mark.asyncio
+    async def test_page_still_challenging_does_not_store_clearance(self):
+        from unittest.mock import AsyncMock
+        from mitmproxy import http
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key")
+        flow = self._flow()
+        still_challenge = b"<html><script>window._cf_chl_opt = {};</script></html>"
+        addon._fetch_via_solver = AsyncMock(
+            return_value=http.Response.make(
+                200, still_challenge, {"Content-Type": "text/html"}
+            )
+        )
+        addon._try_extract_clearance_from_solver = AsyncMock(
+            return_value=("test-agent", "unused-clearance")
+        )
+
+        await addon.response(flow)
+
+        assert addon.get_cf_clearance("example.com", "test-agent") is None
+
+
 class TestBasicRequests:
     """Test basic HTTP requests without challenge solving."""
 
