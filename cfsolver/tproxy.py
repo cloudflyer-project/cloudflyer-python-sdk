@@ -19,34 +19,10 @@ from mitmproxy import http, options, ctx
 from mitmproxy.tools.dump import DumpMaster
 
 from .async_client import AsyncCloudflareSolver
+from .detection import Detection, detect as detect_challenge
 from .exceptions import CFSolverProxyError
 
 logger = logging.getLogger(__name__)
-
-# Default challenge page title patterns (multi-language support)
-DEFAULT_TITLE_INDICATORS = [
-    "<title>Just a moment...</title>",
-    "<title>请稀候…</title>",
-    "<title>请稍候...</title>",
-    "<title>Un instant...</title>",
-    "<title>Einen Moment...</title>",
-    "<title>Un momento...</title>",
-    "<title>Bir dakika...</title>",
-    "<title>Um momento...</title>",
-    "<title>Een moment...</title>",
-    "<title>ちょっと待ってください...</title>",
-    "<title>Подождите...</title>",
-]
-
-# Default Cloudflare-specific indicators (high confidence)
-DEFAULT_CF_INDICATORS = [
-    "cf-challenge-running",
-    "cloudflare-challenge",
-    "cf_challenge_response",
-    "cf-under-attack",
-    "cf-checking-browser",
-    "/cdn-cgi/challenge-platform",
-]
 
 
 class CloudflareDetector:
@@ -64,59 +40,30 @@ class CloudflareDetector:
             extra_title_indicators: Additional title patterns to detect challenge pages
             extra_cf_indicators: Additional Cloudflare-specific indicators
         """
-        self.title_indicators = list(DEFAULT_TITLE_INDICATORS)
-        self.cf_indicators = list(DEFAULT_CF_INDICATORS)
+        self.user_markers = list(extra_title_indicators or []) + list(
+            extra_cf_indicators or []
+        )
 
-        if extra_title_indicators:
-            self.title_indicators.extend(extra_title_indicators)
-        if extra_cf_indicators:
-            self.cf_indicators.extend(extra_cf_indicators)
+    def detect(self, response: http.Response, url: str = "") -> Detection:
+        """Classify a response, reporting blocks and near misses."""
+        result = detect_challenge(response, overrides=self.user_markers)
+        if result.is_block:
+            logger.warning(
+                f"Cloudflare block ({result.reason}) for {url}: "
+                "not a challenge, leaving the response untouched"
+            )
+        elif result.is_suspicious:
+            logger.debug(
+                f"Challenge not confirmed for {url} "
+                f"(weak markers only: {', '.join(result.markers)})"
+            )
+        return result
 
     def is_cloudflare_challenge(self, response: http.Response) -> bool:
         """Check if response contains Cloudflare challenge."""
         if not response or not response.content:
             return False
-
-        # Cloudflare challenge pages typically return 403, 503, or 429
-        # Normal pages with status 200 should not be treated as challenges
-        if response.status_code == 200:
-            return False
-
-        try:
-            content = response.content.decode("utf-8", errors="ignore")
-        except:
-            return False
-
-        content_lower = content.lower()
-
-        # Check title indicators with additional validation
-        for indicator in self.title_indicators:
-            if indicator.lower() in content_lower:
-                if any(cf.lower() in content_lower for cf in self.cf_indicators):
-                    logger.debug(f"Detected Cloudflare challenge: title={indicator}")
-                    return True
-                if (
-                    'id="challenge' in content_lower
-                    or 'class="no-js">' in content_lower
-                ):
-                    logger.debug(f"Detected challenge page with title: {indicator}")
-                    return True
-                if response.status_code in [403, 503, 429]:
-                    logger.debug(
-                        f"Detected challenge by title and status code: {indicator}"
-                    )
-                    return True
-
-        # Direct CF indicator matches - only for non-200 responses
-        if response.status_code in [403, 503, 429]:
-            for indicator in self.cf_indicators:
-                if indicator.lower() in content_lower:
-                    logger.debug(
-                        f"Detected Cloudflare challenge indicator: {indicator}"
-                    )
-                    return True
-
-        return False
+        return bool(self.detect(response))
 
 
 class CloudAPIProxyAddon:
@@ -365,7 +312,12 @@ class CloudAPIProxyAddon:
             return
 
         # Check if this is a Cloudflare challenge
-        if self.detector and self.detector.is_cloudflare_challenge(flow.response):
+        detection = (
+            self.detector.detect(flow.response, flow.request.pretty_url)
+            if self.detector
+            else None
+        )
+        if detection:
             host = flow.request.host
             is_solver = False
 

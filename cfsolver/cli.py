@@ -234,6 +234,11 @@ def solve_turnstile(
 )
 @click.option("-S", "--no-cache", is_flag=True, help="Disable cf_clearance caching")
 @click.option(
+    "--detect-marker",
+    multiple=True,
+    help="Extra body substring that marks a challenge page (repeatable)",
+)
+@click.option(
     "-T",
     "--timeout",
     type=int,
@@ -252,6 +257,7 @@ def proxy(
     impersonate,
     disable_detection,
     no_cache,
+    detect_marker,
     timeout,
 ):
     """Start transparent proxy with Cloudflare challenge detection.
@@ -288,6 +294,7 @@ def proxy(
             enable_detection=not disable_detection,
             no_cache=no_cache,
             timeout=timeout,
+            extra_cf_indicators=list(detect_marker) or None,
         )
     except KeyboardInterrupt:
         click.echo("\nProxy stopped by user")

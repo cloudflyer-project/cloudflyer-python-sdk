@@ -527,6 +527,9 @@ cfsolver proxy -D
 # Disable cf_clearance caching
 cfsolver proxy -S
 
+# Treat a custom page as a challenge (e.g. a site-specific interstitial)
+cfsolver proxy --detect-marker "Are you a robot?"
+
 # Custom timeout
 cfsolver proxy -T 180
 ```
@@ -540,6 +543,7 @@ cfsolver proxy -T 180
 -I, --impersonate       Browser to impersonate (default: chrome)
 -D, --disable-detection Disable challenge detection
 -S, --no-cache          Disable cf_clearance caching
+--detect-marker         Extra body substring that marks a challenge (repeatable)
 -T, --timeout           Challenge solve timeout (default: 120)
 ```
 

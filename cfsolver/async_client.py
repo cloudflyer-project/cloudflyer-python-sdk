@@ -27,12 +27,13 @@ import asyncio
 import logging
 import os
 import time
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Iterable
 from urllib.parse import urlparse, unquote
 
 from curl_cffi.requests import AsyncSession, Response
 from pywssocks import WSSocksClient
 
+from .detection import is_challenge_response
 from .tls_utils import is_fingerprint_incompatibility_error, sanitize_ja3
 
 from .exceptions import (
@@ -139,6 +140,7 @@ class AsyncCloudflareSolver:
         use_polling: bool = False,
         use_cache: bool = True,
         polling_interval: float = 2.0,
+        challenge_markers: Optional[Iterable[str]] = None,
     ):
         self.api_key = api_key
         self.api_base = (api_base or os.environ.get("CLOUDFLYER_API_BASE") or "https://solver.zetx.site").rstrip("/")
@@ -150,6 +152,7 @@ class AsyncCloudflareSolver:
         self.use_polling = use_polling
         self.use_cache = use_cache
         self.polling_interval = polling_interval
+        self.challenge_markers = tuple(challenge_markers or ())
 
         self._client: Optional[WSSocksClient] = None
         self._client_task: Optional[asyncio.Task] = None
@@ -333,12 +336,7 @@ class AsyncCloudflareSolver:
             return False
 
     def _detect_challenge(self, resp: Response) -> bool:
-        if resp.status_code not in (403, 503):
-            return False
-        if "cloudflare" not in resp.headers.get("Server", "").lower():
-            return False
-        text = resp.text
-        return any(k in text for k in ["cf-turnstile", "cf-challenge", "Just a moment"])
+        return is_challenge_response(resp, overrides=self.challenge_markers)
 
     def _get_cache_key(self, url: str) -> str:
         """Generate cache key from URL host and proxy."""

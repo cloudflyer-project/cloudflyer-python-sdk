@@ -1,5 +1,6 @@
 from .client import CloudflareSolver
 from .async_client import AsyncCloudflareSolver
+from .detection import Detection, detect, is_challenge_response
 from .exceptions import (
     CFSolverError,
     CFSolverAPIError,
@@ -14,6 +15,9 @@ __version__ = "1.0.5"
 __all__ = [
     "CloudflareSolver",
     "AsyncCloudflareSolver",
+    "Detection",
+    "detect",
+    "is_challenge_response",
     "CFSolverError",
     "CFSolverAPIError",
     "CFSolverChallengeError",

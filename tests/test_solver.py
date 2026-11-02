@@ -115,6 +115,162 @@ class TestChallengeDetection:
         assert solver._detect_challenge(mock_resp) is False
         solver.close()
 
+    def _detect(
+        self, mock_solver_kwargs, status_code, body, headers=None, markers=None
+    ):
+        from unittest.mock import MagicMock
+
+        solver = CloudflareSolver(
+            **mock_solver_kwargs, solve=False, challenge_markers=markers
+        )
+        mock_resp = MagicMock()
+        mock_resp.status_code = status_code
+        mock_resp.headers = headers or {"Server": "cloudflare"}
+        mock_resp.content = body.encode("utf-8")
+        mock_resp.text = body
+        try:
+            return solver._detect_challenge(mock_resp)
+        finally:
+            solver.close()
+
+    def test_detect_challenge_200_managed_challenge(self, mock_solver_kwargs):
+        """A managed challenge served with 200 must be detected."""
+        body = (
+            "<html><head><title>Are you a robot?</title></head><body>"
+            "<script>window._cf_chl_opt = {cvId: '3'};</script>"
+            "</body></html>"
+        )
+        assert self._detect(mock_solver_kwargs, 200, body) is True
+
+    def test_detect_challenge_200_embeds_turnstile_widget(self, mock_solver_kwargs):
+        """A normal page that embeds Turnstile is not a challenge page."""
+        body = (
+            "<html><body>"
+            '<div class="cf-turnstile" data-sitekey="x"></div>'
+            '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>'
+            "</body></html>"
+        )
+        assert self._detect(mock_solver_kwargs, 200, body) is False
+
+    def test_detect_challenge_200_bot_management_script(self, mock_solver_kwargs):
+        """The jsd script Cloudflare injects into normal pages is not a challenge."""
+        body = (
+            "<html><body>real content"
+            '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>'
+            "</body></html>"
+        )
+        assert self._detect(mock_solver_kwargs, 200, body) is False
+
+    def test_detect_challenge_403_orchestrate_page(self, mock_solver_kwargs):
+        """Challenge pages referencing the challenge orchestrator are detected."""
+        body = (
+            "<html><body>"
+            '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1"></script>'
+            "</body></html>"
+        )
+        assert self._detect(mock_solver_kwargs, 403, body) is True
+
+    def test_detect_challenge_200_large_non_html(self, mock_solver_kwargs):
+        """Large non-HTML payloads are not scanned as challenge pages."""
+        body = "x" * (300 * 1024)
+        headers = {"Server": "cloudflare", "Content-Type": "application/javascript"}
+        assert self._detect(mock_solver_kwargs, 200, body, headers) is False
+
+    def test_detect_challenge_mitigated_header(self, mock_solver_kwargs):
+        """cf-mitigated marks a challenge without any page marker."""
+        body = "<html><body>opaque interstitial</body></html>"
+        headers = {"Server": "cloudflare", "cf-mitigated": "challenge"}
+        assert self._detect(mock_solver_kwargs, 200, body, headers) is True
+
+    def test_detect_challenge_custom_marker(self, mock_solver_kwargs):
+        """User markers force detection on pages Cloudflare did not serve."""
+        body = "<html><body><h1>Are you a robot?</h1></body></html>"
+        headers = {"Server": "nginx"}
+        assert self._detect(mock_solver_kwargs, 200, body, headers) is False
+        assert (
+            self._detect(
+                mock_solver_kwargs,
+                200,
+                body,
+                headers,
+                markers=["Are you a robot?"],
+            )
+            is True
+        )
+
+
+class TestDetectionRules:
+    """Test the shared rule table and its structured verdict."""
+
+    @staticmethod
+    def _response(status, body, headers=None):
+        from unittest.mock import MagicMock
+
+        resp = MagicMock()
+        resp.status_code = status
+        resp.headers = headers if headers is not None else {}
+        resp.content = body.encode("utf-8")
+        resp.text = body
+        return resp
+
+    def test_mitigated_header_wins(self):
+        from cfsolver.detection import CHALLENGE, detect
+
+        resp = self._response(200, "<html>opaque</html>", {"cf-mitigated": "challenge"})
+        result = detect(resp)
+        assert result.kind == CHALLENGE
+        assert result.strong is True
+        assert result.reason == "header:cf-mitigated"
+
+    def test_hard_block_is_not_a_challenge(self):
+        from cfsolver.detection import BLOCK, detect
+
+        body = "<html><title>Access denied</title>error code: 1020</html>"
+        result = detect(self._response(403, body, {"Server": "cloudflare"}))
+        assert result.kind == BLOCK
+        assert bool(result) is False
+        assert result.reason == "error:1020"
+
+    def test_single_weak_marker_without_corroboration_is_suspicious(self):
+        from cfsolver.detection import SUSPICIOUS, detect
+
+        result = detect(self._response(403, "Just a moment...", {"Server": "nginx"}))
+        assert result.kind == SUSPICIOUS
+        assert bool(result) is False
+
+    def test_single_weak_marker_with_cloudflare_server_is_challenge(self):
+        from cfsolver.detection import CHALLENGE, detect
+
+        result = detect(
+            self._response(403, "Just a moment...", {"Server": "cloudflare"})
+        )
+        assert result.kind == CHALLENGE
+        assert result.strong is False
+
+    def test_two_weak_markers_are_enough(self):
+        from cfsolver.detection import CHALLENGE, detect
+
+        body = (
+            "Just a moment... <noscript>Please enable JavaScript and cookies</noscript>"
+        )
+        result = detect(self._response(503, body, {"Server": "nginx"}))
+        assert result.kind == CHALLENGE
+
+    def test_override_matches_any_status_code(self):
+        from cfsolver.detection import CHALLENGE, detect
+
+        resp = self._response(200, '{"error": "Are you a robot?"}', {})
+        assert detect(resp).kind != CHALLENGE
+        assert detect(resp, overrides=["are you a robot?"]).kind == CHALLENGE
+
+    def test_weak_markers_ignored_on_success_status(self):
+        from cfsolver.detection import NONE, detect
+
+        result = detect(
+            self._response(200, "Just a moment...", {"Server": "cloudflare"})
+        )
+        assert result.kind == NONE
+
 
 class TestBasicRequests:
     """Test basic HTTP requests without challenge solving."""
