@@ -141,8 +141,6 @@ class AsyncCloudflareSolver:
         use_cache: bool = True,
         polling_interval: float = 2.0,
         challenge_markers: Optional[Iterable[str]] = None,
-        use_linksocks: Optional[bool] = None,
-        linksocks_wss: Optional[bool] = None,
     ):
         self.api_key = api_key
         self.api_base = (
@@ -159,14 +157,6 @@ class AsyncCloudflareSolver:
         self.use_cache = use_cache
         self.polling_interval = polling_interval
         self.challenge_markers = tuple(challenge_markers or ())
-        if use_linksocks is None:
-            env_val = os.environ.get("CLOUDFLYER_USE_LINKSOCKS", "").strip().lower()
-            use_linksocks = env_val not in ("0", "false", "no", "off")
-        self.use_linksocks = use_linksocks
-        if linksocks_wss is None:
-            env_val = os.environ.get("CLOUDFLYER_LINKSOCKS_WSS", "").strip().lower()
-            linksocks_wss = env_val in ("1", "true", "yes", "on")
-        self.linksocks_wss = linksocks_wss
 
         self._client: Optional[WSSocksClient] = None
         self._client_task: Optional[asyncio.Task] = None
@@ -264,27 +254,24 @@ class AsyncCloudflareSolver:
             return "ws://" + url[7:]
         return url
 
-    async def _get_linksocks_config(self) -> Optional[Dict[str, Any]]:
-        """Fetch LinkSocks tunnel config; return None when the service does not provide one.
-
-        Some CloudFlyer deployments solve Cloudflare tasks server-side without a
-        LinkSocks tunnel; treat 404/route-missing as "tunnel optional".
-        """
+    async def _get_linksocks_config(self) -> Dict[str, Any]:
         url = f"{self.api_base}/getLinkSocks"
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         resp = await self._api_client.post(url, headers=headers)
         if resp.status_code != 200:
-            logger.warning(
-                f"LinkSocks config unavailable (HTTP {resp.status_code}); "
-                "continuing without tunnel"
+            error_detail = f"HTTP {resp.status_code}"
+            try:
+                error_data = resp.json()
+                if isinstance(error_data, dict) and "detail" in error_data:
+                    error_detail = error_data["detail"]
+            except:
+                error_detail = resp.text or error_detail
+            raise CFSolverConnectionError(
+                f"Failed to get linksocks config: {error_detail}"
             )
-            return None
         config = resp.json()
         if "url" in config:
-            ls_url = config["url"]
-            if self.linksocks_wss and ls_url.startswith("ws://"):
-                ls_url = "wss://" + ls_url[5:]
-            config["url"] = self._normalize_ws_url(ls_url)
+            config["url"] = self._normalize_ws_url(config["url"])
         return config
 
     async def _connect(self, timeout: float = 10.0):
@@ -301,19 +288,7 @@ class AsyncCloudflareSolver:
         self._client_failed.clear()
 
         try:
-            if not self.use_linksocks:
-                self._linksocks_config = None
-                self._last_connect_error = "linksocks disabled (proceeding without tunnel)"
-                self._client_ready.set()
-                return
-
             self._linksocks_config = await self._get_linksocks_config()
-            if not self._linksocks_config:
-                # No tunnel config: mark connection state so solve can proceed
-                # with a server-side task (no WSSocks client required).
-                self._last_connect_error = "linksocks unavailable (proceeding without tunnel)"
-                self._client_ready.set()
-                return
 
             # Parse upstream proxy if provided (supports socks5:// and http://)
             upstream_host, upstream_username, upstream_password, upstream_type = (
@@ -324,7 +299,6 @@ class AsyncCloudflareSolver:
                 ws_url=self._linksocks_config["url"],
                 token=self._linksocks_config["token"],
                 reverse=True,
-                ignore_ssl=True,
                 upstream_proxy=upstream_host,
                 upstream_username=upstream_username,
                 upstream_password=upstream_password,
@@ -464,22 +438,30 @@ class AsyncCloudflareSolver:
     ):
         _use_cache = self.use_cache if use_cache is None else use_cache
         async with self._lock:
-            # Lazy connect: linksocks tunnel is optional when the service
-            # solves challenges server-side.
+            # Lazy connect: only connect to linksocks when actually solving a challenge
             await self._connect()
+
+            if not self._linksocks_config:
+                error_detail = getattr(self, "_last_connect_error", "connection failed")
+                raise CFSolverConnectionError(
+                    f"CloudFlyer service unavailable: {error_detail}"
+                )
 
             logger.info(f"Starting challenge solve: {url}")
 
-            task: Dict[str, Any] = {"type": "CloudflareTask", "websiteURL": url}
-            if self._linksocks_config:
-                task["linksocks"] = {
-                    "url": self._linksocks_config["url"],
-                    "token": self._linksocks_config["connector_token"],
-                }
-
             resp = await self._api_client.post(
                 f"{self.api_base}/api/createTask",
-                json={"apiKey": self.api_key, "task": task},
+                json={
+                    "apiKey": self.api_key,
+                    "task": {
+                        "type": "CloudflareTask",
+                        "websiteURL": url,
+                        "linksocks": {
+                            "url": self._linksocks_config["url"],
+                            "token": self._linksocks_config["connector_token"],
+                        },
+                    },
+                },
             )
             _raise_for_status(resp)
             data = resp.json()
