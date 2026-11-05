@@ -149,6 +149,8 @@ class CloudflareSolver:
         use_cache: bool = True,
         polling_interval: float = 2.0,
         challenge_markers: Optional[Iterable[str]] = None,
+        use_linksocks: Optional[bool] = None,
+        linksocks_wss: Optional[bool] = None,
     ):
         self.api_key = api_key
         self.api_base = (
@@ -165,6 +167,14 @@ class CloudflareSolver:
         self.use_cache = use_cache
         self.polling_interval = polling_interval
         self.challenge_markers = tuple(challenge_markers or ())
+        if use_linksocks is None:
+            env_val = os.environ.get("CLOUDFLYER_USE_LINKSOCKS", "").strip().lower()
+            use_linksocks = env_val not in ("0", "false", "no", "off")
+        self.use_linksocks = use_linksocks
+        if linksocks_wss is None:
+            env_val = os.environ.get("CLOUDFLYER_LINKSOCKS_WSS", "").strip().lower()
+            linksocks_wss = env_val in ("1", "true", "yes", "on")
+        self.linksocks_wss = linksocks_wss
 
         self._client: Optional[WSSocksClient] = None
         self._client_thread: Optional[threading.Thread] = None
@@ -209,9 +219,20 @@ class CloudflareSolver:
         old_headers = {}
 
         if self._session:
-            old_cookies = dict(self._session.cookies)
-            old_headers = dict(self._session.headers)
-            self._session.close()
+            try:
+                old_cookies = dict(self._session.cookies)
+            except Exception:
+                # Session cookies may contain duplicate names across domains;
+                # treat the jar as unusable when it cannot be enumerated.
+                old_cookies = {}
+            try:
+                old_headers = dict(self._session.headers)
+            except Exception:
+                old_headers = {}
+            try:
+                self._session.close()
+            except Exception:
+                pass
             self._session = None
 
         self._ja3 = ja3
@@ -242,22 +263,22 @@ class CloudflareSolver:
             return "ws://" + url[7:]
         return url
 
-    def _get_linksocks_config(self) -> Dict[str, Any]:
+    def _get_linksocks_config(self) -> Optional[Dict[str, Any]]:
+        """Fetch LinkSocks tunnel config; return None when the service does not provide one.
+
+        Some CloudFlyer deployments solve Cloudflare tasks server-side without a
+        LinkSocks tunnel; treat 404/route-missing as "tunnel optional".
+        """
         url = f"{self.api_base}/getLinkSocks"
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         with Session(verify=False, proxy=self.api_proxy) as s:
             resp = s.post(url, headers=headers)
             if resp.status_code != 200:
-                error_detail = f"HTTP {resp.status_code}"
-                try:
-                    error_data = resp.json()
-                    if isinstance(error_data, dict) and "detail" in error_data:
-                        error_detail = error_data["detail"]
-                except:
-                    error_detail = resp.text or error_detail
-                raise CFSolverConnectionError(
-                    f"Failed to get linksocks config: {error_detail}"
+                logger.warning(
+                    f"LinkSocks config unavailable (HTTP {resp.status_code}); "
+                    "continuing without tunnel"
                 )
+                return None
             try:
                 config = resp.json()
             except Exception as e:
@@ -265,9 +286,12 @@ class CloudflareSolver:
                 raise CFSolverConnectionError(
                     f"Failed to parse linksocks config from {url}: {e}, response preview: {preview}"
                 )
-            if "url" in config:
-                config["url"] = self._normalize_ws_url(config["url"])
-            return config
+        if "url" in config:
+            ls_url = config["url"]
+            if self.linksocks_wss and ls_url.startswith("ws://"):
+                ls_url = "wss://" + ls_url[5:]
+            config["url"] = self._normalize_ws_url(ls_url)
+        return config
 
     def _connect(self, timeout: float = 10.0):
         """Connect to LinkSocks server.
@@ -279,7 +303,20 @@ class CloudflareSolver:
             return
 
         try:
+            if not self.use_linksocks:
+                self._linksocks_config = None
+                self._last_connect_error = "linksocks disabled (proceeding without tunnel)"
+                self._client_ready.set()
+                return
+
             self._linksocks_config = self._get_linksocks_config()
+            if not self._linksocks_config:
+                # No tunnel config: mark connection state so solve can proceed
+                # with a server-side task (no WSSocks client required).
+                self._last_connect_error = "linksocks unavailable (proceeding without tunnel)"
+                self._client_ready.set()
+                return
+
             self._client_ready.clear()
 
             # Parse upstream proxy if provided (supports socks5:// and http://)
@@ -294,6 +331,7 @@ class CloudflareSolver:
                             ws_url=self._linksocks_config["url"],
                             token=self._linksocks_config["token"],
                             reverse=True,
+                            ignore_ssl=True,
                             upstream_proxy=upstream_host,
                             upstream_username=upstream_username,
                             upstream_password=upstream_password,
@@ -450,31 +488,23 @@ class CloudflareSolver:
     ):
         _use_cache = self.use_cache if use_cache is None else use_cache
         with self._lock:
-            # Lazy connect: only connect to linksocks when actually solving a challenge
+            # Lazy connect: linksocks tunnel is optional when the service
+            # solves challenges server-side.
             self._connect()
 
-            if not self._linksocks_config:
-                error_detail = getattr(self, "_last_connect_error", "connection failed")
-                raise CFSolverConnectionError(
-                    f"CloudFlyer service unavailable: {error_detail}"
-                )
-
             logger.info(f"Starting challenge solve: {url}")
+
+            task: Dict[str, Any] = {"type": "CloudflareTask", "websiteURL": url}
+            if self._linksocks_config:
+                task["linksocks"] = {
+                    "url": self._linksocks_config["url"],
+                    "token": self._linksocks_config["connector_token"],
+                }
 
             with Session(verify=False, proxy=self.api_proxy) as api_session:
                 resp = api_session.post(
                     f"{self.api_base}/api/createTask",
-                    json={
-                        "apiKey": self.api_key,
-                        "task": {
-                            "type": "CloudflareTask",
-                            "websiteURL": url,
-                            "linksocks": {
-                                "url": self._linksocks_config["url"],
-                                "token": self._linksocks_config["connector_token"],
-                            },
-                        },
-                    },
+                    json={"apiKey": self.api_key, "task": task},
                 )
                 _raise_for_status(resp)
                 data = resp.json()

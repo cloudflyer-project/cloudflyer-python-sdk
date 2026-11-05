@@ -215,11 +215,21 @@ class CloudAPIProxyAddon:
             except Exception:
                 user_agent = None
 
-            try:
-                # curl_cffi cookie jar is dict-like
-                cf_clearance = session.cookies.get("cf_clearance")
-            except Exception:
-                cf_clearance = None
+            # curl_cffi raises when the jar holds the same cookie name on multiple
+            # domains; scope the lookup to the target host first, then fall back.
+            host = urlparse(url).hostname
+            for candidate_domain in (host, "." + host if host else None, None):
+                try:
+                    if candidate_domain:
+                        cf_clearance = session.cookies.get(
+                            "cf_clearance", domain=candidate_domain
+                        )
+                    else:
+                        cf_clearance = session.cookies.get("cf_clearance")
+                except Exception:
+                    cf_clearance = None
+                if cf_clearance:
+                    break
         except Exception:
             return None, None
 
@@ -315,6 +325,36 @@ class CloudAPIProxyAddon:
         if (
             "/cdn-cgi/challenge-platform" in request_path
             or flow.request.host == "challenges.cloudflare.com"
+        ):
+            return
+
+        # Skip non-document assets (favicons, images, css, js, fonts). Solving
+        # challenges for these wastes API credits and pollutes the solver's
+        # cookie jar with cross-domain __cf_bm entries.
+        path_lower = (request_path or "").lower()
+        if (
+            "/favicon" in path_lower
+            or path_lower.endswith(
+                (
+                    ".ico",
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".gif",
+                    ".webp",
+                    ".svg",
+                    ".css",
+                    ".js",
+                    ".mjs",
+                    ".woff",
+                    ".woff2",
+                    ".ttf",
+                    ".eot",
+                    ".map",
+                    ".mp4",
+                    ".webm",
+                )
+            )
         ):
             return
 
