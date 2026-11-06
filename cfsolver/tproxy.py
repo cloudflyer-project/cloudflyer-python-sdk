@@ -66,6 +66,68 @@ def _find_cookie_value(cookies, name: str, url: str) -> Optional[str]:
     return None
 
 
+# Header used to exclude a single request from cf_clearance injection and
+# caching. It never reaches the upstream server.
+DEFAULT_SKIP_HEADER = "X-CFSolver-Skip"
+
+
+class BypassRule:
+    """A direct pass-through rule for the transparent proxy.
+
+    Matching requests skip challenge detection, solving and caching entirely.
+
+    Supported specs (one per rule string):
+        host:example.com       exact host
+        host:*.example.com     a host and all of its subdomains
+        suffix:.jpg            URL path suffix (query string is ignored)
+
+    An explicit ``=direct`` action suffix is accepted; ``direct`` is the only
+    supported action.
+    """
+
+    def __init__(self, spec: str):
+        raw = (spec or "").strip()
+        if not raw:
+            raise ValueError("empty rule")
+
+        pattern, _, action = raw.partition("=")
+        action = action.strip().lower()
+        if action and action != "direct":
+            raise ValueError(
+                f"unsupported rule action {action!r} in {raw!r}; "
+                "only 'direct' is supported"
+            )
+
+        kind, sep, value = pattern.strip().partition(":")
+        kind = kind.strip().lower()
+        value = value.strip().lower()
+        if not sep or kind not in ("host", "suffix") or not value:
+            raise ValueError(
+                f"invalid rule {raw!r}; expected 'host:PATTERN', "
+                "'host:*.example.com' or 'suffix:.jpg'"
+            )
+
+        self.spec = raw
+        self.kind = kind
+        self.value = value
+        self.host_suffix = False
+        if kind == "host":
+            if self.value.startswith("*.") or self.value.startswith("."):
+                self.host_suffix = True
+                self.value = self.value.lstrip("*.")
+                if not self.value:
+                    raise ValueError(f"invalid rule {raw!r}: empty host pattern")
+
+    def matches(self, host: str, url: str) -> bool:
+        """Check whether a request host and URL match this rule."""
+        host = (host or "").lower()
+        if self.kind == "host":
+            if self.host_suffix:
+                return host == self.value or host.endswith("." + self.value)
+            return host == self.value
+        return urlparse(url).path.lower().endswith(self.value)
+
+
 class CloudflareDetector:
     """Cloudflare challenge detection logic."""
 
@@ -110,6 +172,9 @@ class CloudflareDetector:
 class CloudAPIProxyAddon:
     """MITM addon for transparent proxy with cloud-based challenge solving."""
 
+    # Flow metadata key marking a request that carries the skip header
+    _SKIP_CACHE_META = "cfsolver_skip_cache"
+
     def __init__(
         self,
         api_key: str,
@@ -123,7 +188,16 @@ class CloudAPIProxyAddon:
         polling_interval: float = 2.0,
         extra_title_indicators: Optional[list] = None,
         extra_cf_indicators: Optional[list] = None,
+        rules: Optional[list] = None,
+        success_ttl: float = -1,
+        failure_ttl: float = 0,
+        skip_header: Optional[str] = DEFAULT_SKIP_HEADER,
     ):
+        if success_ttl < -1 or failure_ttl < -1:
+            raise ValueError(
+                "success_ttl and failure_ttl must be -1 (forever), 0 or "
+                "a positive number of seconds"
+            )
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
         self.user_proxy = user_proxy
@@ -133,6 +207,10 @@ class CloudAPIProxyAddon:
         self.no_cache = no_cache
         self.timeout = timeout
         self.polling_interval = polling_interval
+        self.success_ttl = success_ttl
+        self.failure_ttl = failure_ttl
+        self.rules = [BypassRule(spec) for spec in (rules or [])]
+        self.skip_header = (skip_header or "").strip() or None
 
         self.detector = (
             CloudflareDetector(
@@ -148,8 +226,10 @@ class CloudAPIProxyAddon:
         self.host_lock = asyncio.Lock()
 
         # Store cf_clearance cookies keyed by host and User-Agent
-        # Structure: {host: {user_agent: cf_clearance}}
-        self.cf_clearance_store: Dict[str, Dict[str, str]] = {}
+        # Structure: {host: {user_agent: (cf_clearance, stored_at)}}
+        self.cf_clearance_store: Dict[str, Dict[str, Tuple[str, float]]] = {}
+        # Failed-solve cooldown: {host: monotonic deadline}
+        self.solve_failures: Dict[str, float] = {}
         self._store_lock = threading.Lock()
 
         # Lazy async solver (created on first use inside async response handler)
@@ -307,9 +387,34 @@ class CloudAPIProxyAddon:
             except Exception:
                 pass
 
+    def _is_direct(self, flow: http.HTTPFlow) -> bool:
+        """Check whether the request matches a direct pass-through rule."""
+        if not self.rules:
+            return False
+        host = flow.request.host
+        url = flow.request.pretty_url
+        return any(rule.matches(host, url) for rule in self.rules)
+
     def request(self, flow: http.HTTPFlow):
         """Handle incoming request - inject cached cf_clearance if available."""
+        # The skip header is a control header: it is stripped before forwarding
+        # and excludes this request from injection and cache writes.
+        skip_cache = False
+        if self.skip_header and self.skip_header in flow.request.headers:
+            skip_cache = True
+            flow.request.headers.pop(self.skip_header, None)
+            flow.metadata[self._SKIP_CACHE_META] = True
+            logger.debug(
+                f"[Skip header] {self.skip_header} set for {flow.request.pretty_url}"
+            )
+
         if self.no_cache:
+            return
+
+        if self._is_direct(flow):
+            return
+
+        if skip_cache:
             return
 
         # Inject stored cf_clearance for first request if available (keyed by host and UA)
@@ -343,6 +448,10 @@ class CloudAPIProxyAddon:
         if not self.enable_detection or not flow.response:
             return
 
+        # Direct rules leave the flow untouched (no injection, solving or caching)
+        if self._is_direct(flow):
+            return
+
         # Skip CF internal API requests
         request_path = flow.request.path
         if (
@@ -359,7 +468,13 @@ class CloudAPIProxyAddon:
         )
         if detection:
             host = flow.request.host
+            skip_cache = bool(flow.metadata.get(self._SKIP_CACHE_META, False))
             is_solver = False
+
+            # A host whose solve failed recently is passed through untouched
+            if self.is_solve_blocked(host):
+                logger.debug(f"[Failure hold] Not solving {flow.request.pretty_url}")
+                return
 
             # In no_cache mode, every request solves independently (no host-level serialization)
             if self.no_cache:
@@ -383,21 +498,22 @@ class CloudAPIProxyAddon:
                             return
 
                     # After waiting, get stored cf_clearance and re-fetch
-                    stored = self.get_cf_clearance_for_host(host)
-                    if stored:
-                        stored_ua, stored_cf = stored
-                        refetch_result = await self._fetch_via_solver(
-                            flow,
-                            url,
-                            solve=False,
-                            user_agent=stored_ua,
-                            cf_clearance=stored_cf,
-                        )
-                        if refetch_result:
-                            flow.response = refetch_result
-                            logger.debug(
-                                f"Waiter re-fetched {url} with stored cf_clearance"
+                    if not skip_cache:
+                        stored = self.get_cf_clearance_for_host(host)
+                        if stored:
+                            stored_ua, stored_cf = stored
+                            refetch_result = await self._fetch_via_solver(
+                                flow,
+                                url,
+                                solve=False,
+                                user_agent=stored_ua,
+                                cf_clearance=stored_cf,
                             )
+                            if refetch_result:
+                                flow.response = refetch_result
+                                logger.debug(
+                                    f"Waiter re-fetched {url} with stored cf_clearance"
+                                )
                     return
 
                 # This is the solver thread
@@ -410,6 +526,8 @@ class CloudAPIProxyAddon:
                     logger.error(
                         "Challenge solve failed: solver fetch returned no response"
                     )
+                    if not skip_cache:
+                        self.record_solve_failure(host)
                     return
 
                 flow.response = solved_response
@@ -418,25 +536,32 @@ class CloudAPIProxyAddon:
                 # An unusable solve (error status or a page that is still a
                 # challenge) must not seed the cache, or every later request
                 # gets a clearance that was never accepted.
-                if not self.no_cache:
-                    if not _is_cleared_response(solved_response):
-                        logger.warning(
-                            f"[Cache SKIP] Solve did not clear {host}: "
-                            f"HTTP {solved_response.status_code}"
-                        )
-                        return
-                    ua, cf = await self._try_extract_clearance_from_solver(url)
-                    if ua and cf:
-                        self.set_cf_clearance(host, ua, cf)
-                        logger.info(f"[Cache STORE] Stored cf_clearance for {host}")
-                    else:
-                        logger.warning(
-                            f"[Cache SKIP] user_agent={bool(ua)}, cf_clearance={bool(cf)}"
-                        )
+                if self.no_cache or skip_cache:
+                    if skip_cache:
+                        logger.debug(f"[Cache SKIP] {self.skip_header} set for {url}")
+                    return
+                if not _is_cleared_response(solved_response):
+                    logger.warning(
+                        f"[Cache SKIP] Solve did not clear {host}: "
+                        f"HTTP {solved_response.status_code}"
+                    )
+                    self.record_solve_failure(host)
+                    return
+                ua, cf = await self._try_extract_clearance_from_solver(url)
+                if ua and cf:
+                    self.set_cf_clearance(host, ua, cf)
+                    self.clear_solve_failure(host)
+                    logger.info(f"[Cache STORE] Stored cf_clearance for {host}")
+                else:
+                    logger.warning(
+                        f"[Cache SKIP] user_agent={bool(ua)}, cf_clearance={bool(cf)}"
+                    )
                 return
 
             except Exception as e:
                 logger.error(f"Error resolving challenge for {url}: {e}")
+                if is_solver and not skip_cache:
+                    self.record_solve_failure(host)
             finally:
                 # Only release lock if we acquired one (i.e., not in no_cache mode)
                 # Ensure lock is always released even if exceptions occur before try block
@@ -451,13 +576,20 @@ class CloudAPIProxyAddon:
         """Store cf_clearance for host and User-Agent."""
         if not host or not user_agent or not cf_clearance:
             return
+        if self.success_ttl == 0:
+            return
         key_host = host.lower()
         with self._store_lock:
             inner = self.cf_clearance_store.get(key_host)
             if inner is None:
                 inner = {}
                 self.cf_clearance_store[key_host] = inner
-            inner[user_agent] = cf_clearance
+            inner[user_agent] = (cf_clearance, time.monotonic())
+
+    def _clearance_expired(self, stored_at: float) -> bool:
+        if self.success_ttl < 0:
+            return False
+        return time.monotonic() - stored_at > self.success_ttl
 
     def get_cf_clearance(self, host: str, user_agent: str) -> Optional[str]:
         """Retrieve cf_clearance for host and User-Agent if present."""
@@ -468,7 +600,16 @@ class CloudAPIProxyAddon:
             inner = self.cf_clearance_store.get(key_host)
             if not inner:
                 return None
-            return inner.get(user_agent)
+            entry = inner.get(user_agent)
+            if entry is None:
+                return None
+            cf_clearance, stored_at = entry
+            if self._clearance_expired(stored_at):
+                inner.pop(user_agent, None)
+                if not inner:
+                    self.cf_clearance_store.pop(key_host, None)
+                return None
+            return cf_clearance
 
     def get_cf_clearance_for_host(self, host: str) -> Optional[tuple]:
         """Get any stored cf_clearance for a host. Returns (user_agent, cf_clearance) tuple."""
@@ -479,10 +620,59 @@ class CloudAPIProxyAddon:
             inner = self.cf_clearance_store.get(key_host)
             if not inner:
                 return None
-            for ua, cf in inner.items():
-                if ua and cf:
-                    return ua, cf
-            return None
+            found = None
+            expired = []
+            for ua, (cf, stored_at) in inner.items():
+                if self._clearance_expired(stored_at):
+                    expired.append(ua)
+                    continue
+                if ua and cf and found is None:
+                    found = (ua, cf)
+            for ua in expired:
+                inner.pop(ua, None)
+            if not inner:
+                self.cf_clearance_store.pop(key_host, None)
+            return found
+
+    # --- failed-solve cooldown helpers ---
+    def record_solve_failure(self, host: str) -> None:
+        """Hold off solving a host for a while after a failed solve."""
+        if not host or self.no_cache or self.failure_ttl == 0:
+            return
+        deadline = (
+            float("inf")
+            if self.failure_ttl < 0
+            else time.monotonic() + self.failure_ttl
+        )
+        with self._store_lock:
+            self.solve_failures[host.lower()] = deadline
+        if self.failure_ttl < 0:
+            logger.warning(f"[Solve FAIL] {host}: not solving again this session")
+        else:
+            logger.warning(
+                f"[Solve FAIL] {host}: not solving again for {self.failure_ttl}s"
+            )
+
+    def is_solve_blocked(self, host: str) -> bool:
+        """Check whether a recent failed solve puts the host in a cooldown."""
+        if not host or self.no_cache or self.failure_ttl == 0:
+            return False
+        key_host = host.lower()
+        with self._store_lock:
+            deadline = self.solve_failures.get(key_host)
+            if deadline is None:
+                return False
+            if time.monotonic() >= deadline:
+                self.solve_failures.pop(key_host, None)
+                return False
+            return True
+
+    def clear_solve_failure(self, host: str) -> None:
+        """Drop the failed-solve cooldown for a host."""
+        if not host:
+            return
+        with self._store_lock:
+            self.solve_failures.pop(host.lower(), None)
 
     def clear_cf_clearance(
         self, host: Optional[str] = None, user_agent: Optional[str] = None
@@ -521,6 +711,10 @@ class CloudAPITransparentProxy:
         timeout: int = 120,
         extra_title_indicators: Optional[list] = None,
         extra_cf_indicators: Optional[list] = None,
+        rules: Optional[list] = None,
+        success_ttl: float = -1,
+        failure_ttl: float = 0,
+        skip_header: Optional[str] = DEFAULT_SKIP_HEADER,
     ):
         self.api_key = api_key
         self.api_base = api_base
@@ -550,6 +744,10 @@ class CloudAPITransparentProxy:
             timeout=timeout,
             extra_title_indicators=extra_title_indicators,
             extra_cf_indicators=extra_cf_indicators,
+            rules=rules,
+            success_ttl=success_ttl,
+            failure_ttl=failure_ttl,
+            skip_header=skip_header,
         )
 
         self._master = None
@@ -823,6 +1021,10 @@ def start_transparent_proxy(
     timeout: int = 120,
     extra_title_indicators: Optional[list] = None,
     extra_cf_indicators: Optional[list] = None,
+    rules: Optional[list] = None,
+    success_ttl: float = -1,
+    failure_ttl: float = 0,
+    skip_header: Optional[str] = DEFAULT_SKIP_HEADER,
 ):
     """Start transparent proxy server with configuration.
 
@@ -839,6 +1041,13 @@ def start_transparent_proxy(
         timeout: Challenge solve timeout in seconds
         extra_title_indicators: Additional title patterns to detect challenge pages
         extra_cf_indicators: Additional Cloudflare-specific indicators
+        rules: Direct pass-through rules, e.g. ["suffix:.jpg", "host:*.example.com"]
+        success_ttl: Seconds a solved cf_clearance stays cached
+            (-1 = forever, 0 = do not cache)
+        failure_ttl: Seconds to skip re-solving a host after a failed solve
+            (0 = retry every time, -1 = for the rest of the session)
+        skip_header: Request header that excludes a request from injection and
+            caching; it is stripped before forwarding (None or "" disables)
     """
     proxy = CloudAPITransparentProxy(
         api_key=api_key,
@@ -853,6 +1062,10 @@ def start_transparent_proxy(
         timeout=timeout,
         extra_title_indicators=extra_title_indicators,
         extra_cf_indicators=extra_cf_indicators,
+        rules=rules,
+        success_ttl=success_ttl,
+        failure_ttl=failure_ttl,
+        skip_header=skip_header,
     )
 
     shutdown_event = threading.Event()

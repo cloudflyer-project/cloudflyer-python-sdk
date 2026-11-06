@@ -8,6 +8,7 @@ Run with: pytest tests/test_solver.py -v
 """
 
 import importlib.util
+import time
 
 import pytest
 
@@ -345,6 +346,7 @@ class TestProxyClearanceCache:
             response=http.Response.make(
                 403, b"Just a moment...", {"Server": "cloudflare"}
             ),
+            metadata={},
         )
 
     @pytest.mark.asyncio
@@ -459,6 +461,254 @@ class TestProxyClearanceCache:
         )
 
         assert cf == "parent-value"
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("mitmproxy") is None,
+    reason="mitmproxy is only installed with cfsolver[proxy]",
+)
+class TestBypassRules:
+    """Direct pass-through rules must skip injection, solving and caching."""
+
+    @staticmethod
+    def _flow(url="https://example.com/protected"):
+        from types import SimpleNamespace
+        from mitmproxy import http
+
+        return SimpleNamespace(
+            request=http.Request.make("GET", url, headers={"User-Agent": "test-agent"}),
+            response=http.Response.make(
+                403, b"Just a moment...", {"Server": "cloudflare"}
+            ),
+            metadata={},
+        )
+
+    def test_host_rule_matches_exact_host_only(self):
+        from cfsolver.tproxy import BypassRule
+
+        rule = BypassRule("host:Example.com")
+        assert rule.matches("example.com", "https://example.com/page")
+        assert not rule.matches("www.example.com", "https://www.example.com/page")
+
+    def test_host_rule_matches_subdomains(self):
+        from cfsolver.tproxy import BypassRule
+
+        for spec in ("host:*.example.com", "host:.example.com"):
+            rule = BypassRule(spec)
+            assert rule.matches("example.com", "https://example.com/page")
+            assert rule.matches("static.example.com", "https://static.example.com/x")
+            assert not rule.matches("badexample.com", "https://badexample.com/x")
+
+    def test_suffix_rule_matches_path_ignoring_query(self):
+        from cfsolver.tproxy import BypassRule
+
+        rule = BypassRule("suffix:.jpg")
+        assert rule.matches("example.com", "https://example.com/img/pic.jpg")
+        assert rule.matches("example.com", "https://example.com/img/pic.jpg?size=2")
+        assert not rule.matches("example.com", "https://example.com/img/pic.jpg.html")
+
+    def test_direct_action_suffix_is_accepted(self):
+        from cfsolver.tproxy import BypassRule
+
+        rule = BypassRule("suffix:.png=direct")
+        assert rule.matches("example.com", "https://example.com/logo.png")
+
+    def test_invalid_specs_raise(self):
+        from cfsolver.tproxy import BypassRule
+
+        for spec in ("", "suffix:", "example.com", "suffix:.jpg=block", "regex:.*"):
+            with pytest.raises(ValueError):
+                BypassRule(spec)
+
+    def test_request_does_not_inject_into_rule_matches(self):
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key", rules=["suffix:.jpg"])
+        addon.set_cf_clearance("example.com", "test-agent", "cached-clearance")
+
+        direct_flow = self._flow("https://example.com/pic.jpg")
+        addon.request(direct_flow)
+        assert "Cookie" not in direct_flow.request.headers
+
+        normal_flow = self._flow("https://example.com/page")
+        addon.request(normal_flow)
+        assert "cf_clearance=cached-clearance" in normal_flow.request.headers["Cookie"]
+
+    @pytest.mark.asyncio
+    async def test_response_does_not_solve_rule_matches(self):
+        from unittest.mock import AsyncMock
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key", rules=["suffix:.jpg"])
+        flow = self._flow("https://example.com/pic.jpg")
+        solve = AsyncMock(return_value=None)
+        addon._fetch_via_solver = solve
+
+        await addon.response(flow)
+
+        solve.assert_not_awaited()
+        assert flow.response.status_code == 403
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("mitmproxy") is None,
+    reason="mitmproxy is only installed with cfsolver[proxy]",
+)
+class TestSkipHeaderAndCacheRetention:
+    """The skip header and the success/failure cache retention settings."""
+
+    @staticmethod
+    def _flow(url="https://example.com/protected"):
+        from types import SimpleNamespace
+        from mitmproxy import http
+
+        return SimpleNamespace(
+            request=http.Request.make("GET", url, headers={"User-Agent": "test-agent"}),
+            response=http.Response.make(
+                403, b"Just a moment...", {"Server": "cloudflare"}
+            ),
+            metadata={},
+        )
+
+    def test_skip_header_strips_header_and_blocks_injection(self):
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key")
+        addon.set_cf_clearance("example.com", "test-agent", "cached-clearance")
+        flow = self._flow()
+        flow.request.headers["x-cfsolver-skip"] = "1"
+
+        addon.request(flow)
+
+        assert "X-CFSolver-Skip" not in flow.request.headers
+        assert "Cookie" not in flow.request.headers
+        assert flow.metadata[CloudAPIProxyAddon._SKIP_CACHE_META] is True
+
+    def test_skip_header_can_be_disabled(self):
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key", skip_header="")
+        addon.set_cf_clearance("example.com", "test-agent", "cached-clearance")
+        flow = self._flow()
+        flow.request.headers["X-CFSolver-Skip"] = "1"
+
+        addon.request(flow)
+
+        assert "X-CFSolver-Skip" in flow.request.headers
+        assert "cf_clearance=cached-clearance" in flow.request.headers["Cookie"]
+
+    @pytest.mark.asyncio
+    async def test_skip_header_prevents_cache_stores(self):
+        from unittest.mock import AsyncMock
+        from mitmproxy import http
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key")
+        flow = self._flow()
+        flow.request.headers["X-CFSolver-Skip"] = "1"
+        addon._fetch_via_solver = AsyncMock(
+            return_value=http.Response.make(
+                200, b"<html>article</html>", {"Content-Type": "text/html"}
+            )
+        )
+        addon._try_extract_clearance_from_solver = AsyncMock(
+            return_value=("test-agent", "fresh-clearance")
+        )
+
+        addon.request(flow)
+        await addon.response(flow)
+
+        assert flow.response.status_code == 200
+        assert addon.get_cf_clearance("example.com", "test-agent") is None
+
+    def test_success_ttl_zero_does_not_store(self):
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key", success_ttl=0)
+        addon.set_cf_clearance("example.com", "test-agent", "cf")
+        assert addon.get_cf_clearance("example.com", "test-agent") is None
+
+    def test_success_ttl_expires_cached_clearance(self):
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key", success_ttl=0.05)
+        addon.set_cf_clearance("example.com", "test-agent", "cf")
+        assert addon.get_cf_clearance("example.com", "test-agent") == "cf"
+        time.sleep(0.1)
+        assert addon.get_cf_clearance("example.com", "test-agent") is None
+        assert addon.get_cf_clearance_for_host("example.com") is None
+
+    def test_success_ttl_default_keeps_clearance(self):
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key")
+        addon.set_cf_clearance("example.com", "test-agent", "cf")
+        assert addon.get_cf_clearance_for_host("example.com") == ("test-agent", "cf")
+
+    def test_ttl_below_minus_one_is_rejected(self):
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        with pytest.raises(ValueError):
+            CloudAPIProxyAddon(api_key="test-key", failure_ttl=-2)
+
+    @pytest.mark.asyncio
+    async def test_failed_solve_blocks_later_attempts(self):
+        from unittest.mock import AsyncMock
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key", failure_ttl=60)
+        addon._fetch_via_solver = AsyncMock(return_value=None)
+
+        await addon.response(self._flow())
+        assert addon.is_solve_blocked("example.com") is True
+
+        flow = self._flow()
+        solve = AsyncMock(return_value=None)
+        addon._fetch_via_solver = solve
+        await addon.response(flow)
+
+        solve.assert_not_awaited()
+        assert flow.response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_failure_hold_disabled_by_default(self):
+        from unittest.mock import AsyncMock
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key")
+        addon._fetch_via_solver = AsyncMock(return_value=None)
+        await addon.response(self._flow())
+        assert addon.is_solve_blocked("example.com") is False
+
+    @pytest.mark.asyncio
+    async def test_failure_hold_expires(self):
+        from unittest.mock import AsyncMock
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key", failure_ttl=0.05)
+        addon._fetch_via_solver = AsyncMock(return_value=None)
+        await addon.response(self._flow())
+        assert addon.is_solve_blocked("example.com") is True
+        time.sleep(0.1)
+        assert addon.is_solve_blocked("example.com") is False
+
+    @pytest.mark.asyncio
+    async def test_no_cache_ignores_both_retention_settings(self):
+        from unittest.mock import AsyncMock
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(
+            api_key="test-key", no_cache=True, failure_ttl=60, success_ttl=600
+        )
+        addon._fetch_via_solver = AsyncMock(return_value=None)
+        await addon.response(self._flow())
+        assert addon.is_solve_blocked("example.com") is False
+        assert addon.get_cf_clearance("example.com", "test-agent") is None
+
+        solve = AsyncMock(return_value=None)
+        addon._fetch_via_solver = solve
+        await addon.response(self._flow())
+        solve.assert_awaited()
 
 
 class TestBasicRequests:

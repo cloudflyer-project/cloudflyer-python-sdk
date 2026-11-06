@@ -239,6 +239,36 @@ def solve_turnstile(
     help="Extra body substring that marks a challenge page (repeatable)",
 )
 @click.option(
+    "-R",
+    "--rule",
+    "rules",
+    multiple=True,
+    help="Pass matching requests through directly (no solving or caching), "
+    'e.g. "host:example.com", "host:*.example.com", "suffix:.jpg" (repeatable)',
+)
+@click.option(
+    "--success-ttl",
+    type=float,
+    default=-1,
+    show_default=True,
+    help="Seconds a solved cf_clearance stays cached "
+    "(-1 = forever, 0 = do not cache)",
+)
+@click.option(
+    "--failure-ttl",
+    type=float,
+    default=0,
+    show_default=True,
+    help="Seconds to skip re-solving a host after a failed solve "
+    "(-1 = forever, 0 = retry every time)",
+)
+@click.option(
+    "--skip-header",
+    default=None,
+    help="Request header that disables cf_clearance injection and caching for "
+    'that request (default: "X-CFSolver-Skip"; pass "" to disable)',
+)
+@click.option(
     "-T",
     "--timeout",
     type=int,
@@ -258,6 +288,10 @@ def proxy(
     disable_detection,
     no_cache,
     detect_marker,
+    rules,
+    success_ttl,
+    failure_ttl,
+    skip_header,
     timeout,
 ):
     """Start transparent proxy with Cloudflare challenge detection.
@@ -272,12 +306,16 @@ def proxy(
     Example:
         cfsolver proxy -K your_api_key -P 8080
         cfsolver proxy -K your_api_key -X socks5://127.0.0.1:1080
+        cfsolver proxy --rule "suffix:.jpg" --rule "host:*.static.example.com"
+        cfsolver proxy --success-ttl 600 --failure-ttl 300
         curl -x http://127.0.0.1:8080 https://protected-site.com
     """
-    from .tproxy import start_transparent_proxy
+    from .tproxy import DEFAULT_SKIP_HEADER, start_transparent_proxy
 
     api_key = get_api_key(api_key)
     api_base = get_api_base(api_base)
+    if skip_header is None:
+        skip_header = DEFAULT_SKIP_HEADER
 
     logger = logging.getLogger(__name__)
     logger.info(f"Starting transparent proxy on {host}:{port}")
@@ -295,6 +333,10 @@ def proxy(
             no_cache=no_cache,
             timeout=timeout,
             extra_cf_indicators=list(detect_marker) or None,
+            rules=list(rules) or None,
+            success_ttl=success_ttl,
+            failure_ttl=failure_ttl,
+            skip_header=skip_header,
         )
     except KeyboardInterrupt:
         click.echo("\nProxy stopped by user")
