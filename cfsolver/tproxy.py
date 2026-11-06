@@ -32,6 +32,40 @@ def _is_cleared_response(response: http.Response) -> bool:
     return not detect_challenge(response)
 
 
+def _find_cookie_value(cookies, name: str, url: str) -> Optional[str]:
+    """Read a cookie for the URL's host without domain ambiguity.
+
+    Same-named cookies can live on unrelated domains with different values,
+    which makes an unqualified read raise CookieConflict. Prefer an exact
+    host match, then a parent-domain match, and only fall back to a lone
+    candidate when nothing matches the host.
+    """
+    host = (urlparse(url).hostname or "").lower()
+    jar = getattr(cookies, "jar", cookies)
+
+    exact = None
+    parent = None
+    others = []
+    for cookie in jar:
+        if cookie.name != name or not cookie.value:
+            continue
+        domain = (cookie.domain or "").lstrip(".").lower()
+        if domain and host and domain == host:
+            exact = exact or cookie.value
+        elif domain and host and host.endswith("." + domain):
+            parent = parent or cookie.value
+        else:
+            others.append(cookie.value)
+
+    if exact:
+        return exact
+    if parent:
+        return parent
+    if len(others) == 1:
+        return others[0]
+    return None
+
+
 class CloudflareDetector:
     """Cloudflare challenge detection logic."""
 
@@ -216,8 +250,7 @@ class CloudAPIProxyAddon:
                 user_agent = None
 
             try:
-                # curl_cffi cookie jar is dict-like
-                cf_clearance = session.cookies.get("cf_clearance")
+                cf_clearance = _find_cookie_value(session.cookies, "cf_clearance", url)
             except Exception:
                 cf_clearance = None
         except Exception:

@@ -205,11 +205,14 @@ class CloudflareSolver:
         if self._ja3 == ja3 and self._akamai == akamai:
             return
 
-        old_cookies = {}
+        old_cookies = []
         old_headers = {}
 
         if self._session:
-            old_cookies = dict(self._session.cookies)
+            # Copy cookie objects as-is so domain, path and secure flags
+            # survive. A name->value dict would raise CookieConflict for
+            # same-named cookies on unrelated domains and drop the domain.
+            old_cookies = list(self._session.cookies.jar)
             old_headers = dict(self._session.headers)
             self._session.close()
             self._session = None
@@ -228,8 +231,8 @@ class CloudflareSolver:
             self._ja3 = None
             self._akamai = None
             session = self._get_session()
-        for k, v in old_cookies.items():
-            session.cookies.set(k, v)
+        for cookie in old_cookies:
+            session.cookies.jar.set_cookie(cookie)
         for k, v in old_headers.items():
             session.headers[k] = v
 

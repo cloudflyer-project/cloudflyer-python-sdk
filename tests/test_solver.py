@@ -294,6 +294,40 @@ class TestClearanceCache:
             assert await solver._load_from_cache("https://example.com") is False
 
 
+class TestSessionCookiePreservation:
+    """Session rebuilds must keep cookies keyed by their domain."""
+
+    def test_reset_session_preserves_multi_domain_cookies(self, mock_solver_kwargs):
+        solver = CloudflareSolver(**mock_solver_kwargs, solve=False)
+        session = solver._get_session()
+        session.cookies.set("cf_clearance", "value-a", domain="a.example.com")
+        session.cookies.set("cf_clearance", "value-b", domain="b.example.com")
+
+        solver._reset_session(ja3="test-ja3")
+
+        session = solver._get_session()
+        cookies = {cookie.domain: cookie.value for cookie in session.cookies.jar}
+        assert cookies["a.example.com"] == "value-a"
+        assert cookies["b.example.com"] == "value-b"
+        solver.close()
+
+    @pytest.mark.asyncio
+    async def test_reset_session_preserves_multi_domain_cookies_async(
+        self, mock_solver_kwargs
+    ):
+        async with AsyncCloudflareSolver(**mock_solver_kwargs, solve=False) as solver:
+            session = await solver._get_session()
+            session.cookies.set("cf_clearance", "value-a", domain="a.example.com")
+            session.cookies.set("cf_clearance", "value-b", domain="b.example.com")
+
+            await solver._reset_session(ja3="test-ja3")
+
+            session = await solver._get_session()
+            cookies = {cookie.domain: cookie.value for cookie in session.cookies.jar}
+            assert cookies["a.example.com"] == "value-a"
+            assert cookies["b.example.com"] == "value-b"
+
+
 @pytest.mark.skipif(
     importlib.util.find_spec("mitmproxy") is None,
     reason="mitmproxy is only installed with cfsolver[proxy]",
@@ -377,6 +411,54 @@ class TestProxyClearanceCache:
         await addon.response(flow)
 
         assert addon.get_cf_clearance("example.com", "test-agent") is None
+
+    @pytest.mark.asyncio
+    async def test_extract_clearance_matches_requested_host(self):
+        from types import SimpleNamespace
+        from curl_cffi.requests import Cookies
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key")
+        cookies = Cookies()
+        cookies.set("cf_clearance", "value-for-a", domain="a.example.com")
+        cookies.set("cf_clearance", "value-for-b", domain="b.example.com")
+        session = SimpleNamespace(headers={"User-Agent": "test-agent"}, cookies=cookies)
+
+        class FakeSolver:
+            async def _get_session(self):
+                return session
+
+        addon._solver = FakeSolver()
+
+        ua, cf = await addon._try_extract_clearance_from_solver(
+            "https://b.example.com/article"
+        )
+
+        assert ua == "test-agent"
+        assert cf == "value-for-b"
+
+    @pytest.mark.asyncio
+    async def test_extract_clearance_uses_parent_domain_cookie(self):
+        from types import SimpleNamespace
+        from curl_cffi.requests import Cookies
+        from cfsolver.tproxy import CloudAPIProxyAddon
+
+        addon = CloudAPIProxyAddon(api_key="test-key")
+        cookies = Cookies()
+        cookies.set("cf_clearance", "parent-value", domain=".example.com")
+        session = SimpleNamespace(headers={"User-Agent": "test-agent"}, cookies=cookies)
+
+        class FakeSolver:
+            async def _get_session(self):
+                return session
+
+        addon._solver = FakeSolver()
+
+        _, cf = await addon._try_extract_clearance_from_solver(
+            "https://www.example.com/article"
+        )
+
+        assert cf == "parent-value"
 
 
 class TestBasicRequests:

@@ -115,7 +115,7 @@ def solve_cloudflare(
                 "success": True,
                 "url": url,
                 "status_code": resp.status_code,
-                "cookies": dict(solver._session.cookies),
+                "cookies": {c.name: c.value for c in solver._session.cookies.jar},
                 "user_agent": solver._session.headers.get("User-Agent", ""),
             }
 
@@ -389,7 +389,7 @@ def request(
                     "method": method.upper(),
                     "status_code": resp.status_code,
                     "headers": dict(resp.headers),
-                    "cookies": dict(solver._session.cookies),
+                    "cookies": {c.name: c.value for c in solver._session.cookies.jar},
                     "content_length": len(resp.content),
                 }
                 click.echo(json.dumps(result, indent=2))
