@@ -206,24 +206,16 @@ class AsyncCloudflareSolver:
         if self._ja3 == ja3 and self._akamai == akamai:
             return
 
-        old_cookies = {}
+        old_cookies = []
         old_headers = {}
 
         if self._session:
-            try:
-                old_cookies = dict(self._session.cookies)
-            except Exception:
-                # Session cookies may contain duplicate names across domains;
-                # treat the jar as unusable when it cannot be enumerated.
-                old_cookies = {}
-            try:
-                old_headers = dict(self._session.headers)
-            except Exception:
-                old_headers = {}
-            try:
-                await self._session.close()
-            except Exception:
-                pass
+            # Copy cookie objects as-is so domain, path and secure flags
+            # survive. A name->value dict would raise CookieConflict for
+            # same-named cookies on unrelated domains and drop the domain.
+            old_cookies = list(self._session.cookies.jar)
+            old_headers = dict(self._session.headers)
+            await self._session.close()
             self._session = None
 
         self._ja3 = ja3
@@ -240,8 +232,8 @@ class AsyncCloudflareSolver:
             self._ja3 = None
             self._akamai = None
             session = await self._get_session()
-        for k, v in old_cookies.items():
-            session.cookies.set(k, v)
+        for cookie in old_cookies:
+            session.cookies.jar.set_cookie(cookie)
         for k, v in old_headers.items():
             session.headers[k] = v
 

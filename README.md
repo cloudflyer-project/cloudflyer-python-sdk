@@ -303,6 +303,13 @@ cfsolver proxy -D
 
 # Disable cookie caching (solve every challenge)
 cfsolver proxy -S
+
+# Pass matching requests through directly (no detection, injection or solving)
+cfsolver proxy --rule "suffix:.jpg" --rule "host:*.static.example.com"
+
+# Keep a solved cf_clearance for 10 minutes; after a failed solve, pass the
+# host through for 5 minutes before retrying
+cfsolver proxy --success-ttl 600 --failure-ttl 300
 ```
 
 Then use the proxy with any HTTP client:
@@ -366,6 +373,23 @@ with CloudAPITransparentProxy(api_key="your-api-key", port=8080) as proxy:
     proxy.clear_cf_clearance()
 ```
 
+### Direct Rules and Cache Retention
+
+Rules pass matching requests through untouched (no challenge detection, solving or caching) — useful for static assets and hosts that should never go through the solver:
+
+```python
+with CloudAPITransparentProxy(
+    api_key="your-api-key",
+    port=8080,
+    rules=["suffix:.jpg", "host:*.static.example.com"],
+) as proxy:
+    ...
+```
+
+`success_ttl` controls how long a solved `cf_clearance` stays cached before the proxy solves again (`-1` = forever, default; `0` = do not cache). `failure_ttl` controls how long a host is passed through after a failed solve before the proxy retries (`0` = retry immediately, default; `-1` = for the rest of the session). With `no_cache=True` both settings are ignored and every challenge is solved again.
+
+A request carrying the `skip_header` (`X-CFSolver-Skip` by default) is exempt from cf_clearance injection and from cache writes; the header is stripped before the request is forwarded.
+
 ### Proxy Options
 
 | Parameter | Type | Default | Description |
@@ -382,6 +406,10 @@ with CloudAPITransparentProxy(api_key="your-api-key", port=8080) as proxy:
 | `timeout` | int | `120` | Challenge solve timeout (seconds) |
 | `extra_title_indicators` | list | None | Additional title patterns for detection |
 | `extra_cf_indicators` | list | None | Additional CF-specific indicators |
+| `rules` | list | None | Direct pass-through rules, e.g. `["suffix:.jpg", "host:*.example.com"]` |
+| `success_ttl` | float | `-1` | Seconds a solved cf_clearance stays cached (`-1` = forever, `0` = do not cache) |
+| `failure_ttl` | float | `0` | Seconds to skip re-solving a host after a failed solve (`0` = retry every time, `-1` = forever) |
+| `skip_header` | str | `X-CFSolver-Skip` | Request header that disables injection and caching for that request |
 
 ---
 
@@ -532,6 +560,17 @@ cfsolver proxy --detect-marker "Are you a robot?"
 
 # Custom timeout
 cfsolver proxy -T 180
+
+# Pass matching requests through directly (repeatable)
+cfsolver proxy --rule "suffix:.jpg" --rule "host:*.static.example.com"
+
+# Cache retention: reuse a solved cf_clearance for 10 minutes and back off
+# failed hosts for 5 minutes
+cfsolver proxy --success-ttl 600 --failure-ttl 300
+
+# Skip injection and caching for a single request (the header is removed
+# before the request is forwarded)
+curl -k -x http://127.0.0.1:8080 -H "X-CFSolver-Skip: 1" https://protected-site.com
 ```
 
 **Options:**
@@ -544,6 +583,10 @@ cfsolver proxy -T 180
 -D, --disable-detection Disable challenge detection
 -S, --no-cache          Disable cf_clearance caching
 --detect-marker         Extra body substring that marks a challenge (repeatable)
+-R, --rule              Direct pass-through rule (repeatable)
+--success-ttl           Seconds a solved cf_clearance stays cached (default: -1 = forever)
+--failure-ttl           Seconds to skip re-solving a host after a failed solve (default: 0 = retry every time)
+--skip-header           Request header that disables injection and caching for that request (default: X-CFSolver-Skip)
 -T, --timeout           Challenge solve timeout (default: 120)
 ```
 
