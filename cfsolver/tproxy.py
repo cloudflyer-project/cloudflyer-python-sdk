@@ -12,11 +12,12 @@ import socket
 import threading
 import time
 import signal
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, MutableMapping
 from urllib.parse import urlparse
 
 from mitmproxy import http, options, ctx
 from mitmproxy.tools.dump import DumpMaster
+from curl_cffi.requests import Headers
 
 from .async_client import AsyncCloudflareSolver
 from .detection import Detection, detect as detect_challenge
@@ -251,7 +252,7 @@ class CloudAPIProxyAddon:
         return self._solver
 
     @staticmethod
-    def _remove_hop_by_hop_headers(headers: Dict[str, str]) -> None:
+    def _remove_hop_by_hop_headers(headers: MutableMapping[str, str]) -> None:
         for h in [
             "Host",
             "Connection",
@@ -277,7 +278,10 @@ class CloudAPIProxyAddon:
         try:
             solver = self._get_or_create_solver()
 
-            headers = dict(flow.request.headers)
+            headers = Headers(dict(flow.request.headers))
+            cookie_headers = flow.request.headers.get_all("Cookie")
+            if cookie_headers:
+                headers["Cookie"] = "; ".join(cookie_headers)
             if user_agent:
                 headers["User-Agent"] = user_agent
 
@@ -299,13 +303,16 @@ class CloudAPIProxyAddon:
                 url,
                 headers=headers,
                 data=flow.request.content or None,
+                allow_redirects=False,
                 solve=solve,
-                on_challenge=True,
-                use_cache=not self.no_cache,
+                on_challenge=not solve,
+                # Only the proxy cache validates the response before storing clearance.
+                use_cache=False,
+                _preserve_cookie_header=True,
             )
 
             return http.Response.make(
-                resp.status_code, resp.content, dict(resp.headers)
+                resp.status_code, resp.content, resp.headers.raw
             )
         except Exception as e:
             logger.error(f"Failed to fetch {url} via solver: {e}")

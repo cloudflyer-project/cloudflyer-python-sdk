@@ -30,7 +30,8 @@ import time
 from typing import Optional, Dict, Any, Tuple, Iterable
 from urllib.parse import urlparse, unquote
 
-from curl_cffi.requests import AsyncSession, Response
+from curl_cffi import CurlOpt
+from curl_cffi.requests import AsyncSession, Headers, Response
 from pywssocks import WSSocksClient
 
 from .detection import is_challenge_response
@@ -647,6 +648,66 @@ class AsyncCloudflareSolver:
         logger.info("Turnstile solved successfully")
         return token
 
+    async def _request_with_forwarded_cookies(self, session, method, url, kwargs):
+        headers = Headers(kwargs.get("headers"))
+        cookie_header = headers.pop("Cookie", None)
+        if cookie_header is None:
+            return await session.request(method, url, **kwargs)
+
+        request_kwargs = {**kwargs, "headers": headers}
+        cookie_names = {
+            part.partition("=")[0].strip() for part in cookie_header.split(";")
+        }
+        options = {
+            "verify": False,
+            "proxy": self.user_proxy,
+            "curl_options": {CurlOpt.COOKIE: cookie_header},
+        }
+        if self._ja3 or self._akamai:
+            options.update(ja3=self._ja3, akamai=self._akamai)
+        else:
+            options["impersonate"] = self.impersonate
+
+        # CURLOPT_COOKIE is session-wide, so isolate it from concurrent requests.
+        async with AsyncSession(**options) as forwarded:
+            forwarded.headers.update(session.headers)
+            initial_cookies = {}
+            for cookie in session.cookies.jar:
+                if cookie.name not in cookie_names:
+                    forwarded.cookies.jar.set_cookie(cookie)
+                    initial_cookies[(cookie.domain, cookie.path, cookie.name)] = (
+                        cookie.value,
+                        cookie.expires,
+                        cookie.secure,
+                    )
+            response = await forwarded.request(method, url, **request_kwargs)
+            for cookie in forwarded.cookies.jar:
+                key = (cookie.domain, cookie.path, cookie.name)
+                if initial_cookies.get(key) != (
+                    cookie.value, cookie.expires, cookie.secure
+                ):
+                    session.cookies.jar.set_cookie(cookie)
+            return response
+
+    @staticmethod
+    def _forwarded_headers_after_solve(kwargs, session, url):
+        headers = Headers(kwargs.get("headers"))
+        cookie_header = headers.get("Cookie")
+        domain = urlparse(url).hostname
+        if cookie_header and session.cookies.get("cf_clearance", domain=domain):
+            remaining = [
+                part.strip() for part in cookie_header.split(";")
+                if part.strip() and part.partition("=")[0].strip() != "cf_clearance"
+            ]
+            if remaining:
+                headers["Cookie"] = "; ".join(remaining)
+            else:
+                headers.pop("Cookie", None)
+        user_agent = session.headers.get("User-Agent")
+        if user_agent:
+            headers["User-Agent"] = user_agent
+        return {**kwargs, "headers": headers}
+
     async def request(
         self,
         method: str,
@@ -655,6 +716,7 @@ class AsyncCloudflareSolver:
         solve: Optional[bool] = None,
         on_challenge: Optional[bool] = None,
         use_cache: Optional[bool] = None,
+        _preserve_cookie_header: bool = False,
         **kwargs,
     ) -> Response:
         """
@@ -685,6 +747,10 @@ class AsyncCloudflareSolver:
         async def _request_with_fallback() -> Response:
             nonlocal session
             try:
+                if _preserve_cookie_header:
+                    return await self._request_with_forwarded_cookies(
+                        session, method, url, kwargs
+                    )
                 return await session.request(method, url, **kwargs)
             except Exception as e:
                 if not (self._ja3 or self._akamai):
@@ -697,6 +763,10 @@ class AsyncCloudflareSolver:
                 )
                 await self._reset_session(ja3=None, akamai=None)
                 session = await self._get_session()
+                if _preserve_cookie_header:
+                    return await self._request_with_forwarded_cookies(
+                        session, method, url, kwargs
+                    )
                 return await session.request(method, url, **kwargs)
 
         if not _solve:
@@ -707,6 +777,8 @@ class AsyncCloudflareSolver:
             try:
                 await self._solve_challenge(url, use_cache=_use_cache)
                 session = await self._get_session()
+                if _preserve_cookie_header:
+                    kwargs = self._forwarded_headers_after_solve(kwargs, session, url)
             except Exception as e:
                 logger.warning(f"Pre-solve failed: {e}")
 
@@ -716,6 +788,8 @@ class AsyncCloudflareSolver:
             logger.info("Cloudflare challenge detected")
             await self._solve_challenge(url, resp.text, use_cache=_use_cache)
             session = await self._get_session()
+            if _preserve_cookie_header:
+                kwargs = self._forwarded_headers_after_solve(kwargs, session, url)
             resp = await _request_with_fallback()
 
         return resp
