@@ -264,7 +264,11 @@ def test_sync_cache_does_not_cross_client_identity(origin, same_identity):
             observed = b.get(origin.url + "/echo").json()
             assert observed["Cookie"] == "session=session-B"
             observed_agent = next(
-                (value for key, value in observed.items() if key.lower() == "user-agent"),
+                (
+                    value
+                    for key, value in observed.items()
+                    if key.lower() == "user-agent"
+                ),
                 None,
             )
             assert observed_agent != "agent-A"
@@ -289,7 +293,11 @@ async def test_async_cache_does_not_cross_client_identity(origin, same_identity)
             observed = (await b.get(origin.url + "/echo")).json()
             assert observed["Cookie"] == "session=session-B"
             observed_agent = next(
-                (value for key, value in observed.items() if key.lower() == "user-agent"),
+                (
+                    value
+                    for key, value in observed.items()
+                    if key.lower() == "user-agent"
+                ),
                 None,
             )
             assert observed_agent != "agent-A"
