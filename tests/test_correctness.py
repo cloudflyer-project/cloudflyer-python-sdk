@@ -263,7 +263,11 @@ def test_sync_cache_does_not_cross_client_identity(origin, same_identity):
             b._get_session().cookies.set("session", "session-B", domain="127.0.0.1")
             observed = b.get(origin.url + "/echo").json()
             assert observed["Cookie"] == "session=session-B"
-            assert observed["User-Agent"] != "agent-A"
+            observed_agent = next(
+                (value for key, value in observed.items() if key.lower() == "user-agent"),
+                None,
+            )
+            assert observed_agent != "agent-A"
 
 
 @pytest.mark.parametrize("same_identity", [False, True])
@@ -284,7 +288,11 @@ async def test_async_cache_does_not_cross_client_identity(origin, same_identity)
             )
             observed = (await b.get(origin.url + "/echo")).json()
             assert observed["Cookie"] == "session=session-B"
-            assert observed["User-Agent"] != "agent-A"
+            observed_agent = next(
+                (value for key, value in observed.items() if key.lower() == "user-agent"),
+                None,
+            )
+            assert observed_agent != "agent-A"
 
 
 def test_sync_solve_and_cache_only_apply_clearance(origin):
