@@ -31,7 +31,14 @@ from curl_cffi.requests import Session, Response
 from pywssocks import WSSocksClient
 
 from .detection import is_challenge_response
-from .tls_utils import is_fingerprint_incompatibility_error, sanitize_ja3
+from .tls_utils import (
+    is_fingerprint_configuration_error,
+    is_fingerprint_incompatibility_error,
+    request_body_rewinder,
+    sanitize_ja3,
+)
+from .polling import retry_delay
+from .clearance_cache import ClearanceCache, clearance_cookies
 
 from .exceptions import (
     CFSolverError,
@@ -42,10 +49,6 @@ from .exceptions import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Global cache for clearance data (shared across instances)
-_clearance_cache: Dict[str, Dict[str, Any]] = {}
-_clearance_cache_lock = threading.Lock()
 
 
 def _parse_proxy(
@@ -123,8 +126,8 @@ class CloudflareSolver:
         use_polling: Use interval polling instead of long-polling (default: False).
             When False, uses /waitTaskResult for efficient long-polling.
             When True, uses /getTaskResult with configurable intervals.
-        use_cache: Cache clearance data per host to avoid redundant solves (default: True).
-            Cached data includes cookies, user agent, and TLS fingerprints.
+        use_cache: Cache clearance data per host within this client (default: True).
+            Only cf_clearance, its user agent, and TLS fingerprints are retained.
         polling_interval: Interval in seconds between polling attempts when use_polling=True (default: 2.0)
 
     Examples:
@@ -170,6 +173,13 @@ class CloudflareSolver:
         self._client_thread: Optional[threading.Thread] = None
         self._linksocks_config: Optional[Dict[str, Any]] = None
         self._client_ready = threading.Event()
+        self._client_loop = None
+        self._client_task = None
+        self._client_failed = threading.Event()
+        self._client_stop = threading.Event()
+        self._connect_lock = threading.RLock()
+        self._closed = False
+        self._clearance_cache = ClearanceCache()
 
         # Session state
         self._session: Optional[Session] = None
@@ -178,13 +188,17 @@ class CloudflareSolver:
 
         # Thread lock for session operations
         self._lock = threading.Lock()
+        self._request_lock = threading.RLock()
 
     def _get_session(self) -> Session:
         """Get or create the HTTP session with current fingerprint settings."""
+        if self._closed:
+            raise RuntimeError("Session is closed")
         if self._session is None:
             if self._ja3 or self._akamai:
                 self._session = Session(
                     verify=False,
+                    use_thread_local_curl=False,
                     proxy=self.user_proxy,
                     ja3=self._ja3,
                     akamai=self._akamai,
@@ -192,6 +206,7 @@ class CloudflareSolver:
             else:
                 self._session = Session(
                     verify=False,
+                    use_thread_local_curl=False,
                     proxy=self.user_proxy,
                     impersonate=self.impersonate,
                 )
@@ -223,6 +238,8 @@ class CloudflareSolver:
         try:
             session = self._get_session()
         except Exception as e:
+            if not is_fingerprint_configuration_error(e):
+                raise
             logger.info(
                 "Failed to apply TLS fingerprints (%s); falling back to impersonate=%s",
                 str(e),
@@ -273,65 +290,109 @@ class CloudflareSolver:
             return config
 
     def _connect(self, timeout: float = 10.0):
-        """Connect to LinkSocks server.
-
-        Args:
-            timeout: Maximum time to wait for connection (default: 10 seconds)
-        """
-        if self._client_thread and self._client_thread.is_alive():
-            return
-
-        try:
-            self._linksocks_config = self._get_linksocks_config()
+        """Connect while retaining ownership of setup, connection and worker tasks."""
+        with self._connect_lock:
+            if self._closed:
+                raise RuntimeError("Session is closed")
+            if self.is_connected():
+                return
+            self._stop_client()
             self._client_ready.clear()
+            self._client_failed.clear()
+            self._client_stop.clear()
+            try:
+                self._linksocks_config = self._get_linksocks_config()
+                config = self._linksocks_config
+                upstream_host, upstream_username, upstream_password, upstream_type = (
+                    _parse_proxy(self.user_proxy)
+                )
 
-            # Parse upstream proxy if provided (supports socks5:// and http://)
-            upstream_host, upstream_username, upstream_password, upstream_type = (
-                _parse_proxy(self.user_proxy)
-            )
-
-            def run_client():
-                async def _start():
+                async def start_client():
+                    self._client_loop = asyncio.get_running_loop()
+                    self._client_task = asyncio.current_task()
+                    if self._client_stop.is_set():
+                        return
+                    self._client = WSSocksClient(
+                        ws_url=config["url"],
+                        token=config["token"],
+                        reverse=True,
+                        upstream_proxy=upstream_host,
+                        upstream_username=upstream_username,
+                        upstream_password=upstream_password,
+                        upstream_proxy_type=upstream_type,
+                    )
+                    connection = asyncio.create_task(self._client.connect())
+                    ready = asyncio.create_task(self._client.connected.wait())
                     try:
-                        self._client = WSSocksClient(
-                            ws_url=self._linksocks_config["url"],
-                            token=self._linksocks_config["token"],
-                            reverse=True,
-                            upstream_proxy=upstream_host,
-                            upstream_username=upstream_username,
-                            upstream_password=upstream_password,
-                            upstream_proxy_type=upstream_type,
+                        done, _ = await asyncio.wait(
+                            (connection, ready),
+                            return_when=asyncio.FIRST_COMPLETED,
                         )
-                        task = await self._client.wait_ready(timeout=10)
+                        if connection in done:
+                            await connection
+                            raise CFSolverConnectionError(
+                                "LinkSocks client stopped before readiness"
+                            )
                         self._client_ready.set()
-                        await task
+                        await connection
+                    finally:
+                        connection.cancel()
+                        ready.cancel()
+                        await asyncio.gather(connection, ready, return_exceptions=True)
+
+                def run_client():
+                    try:
+                        asyncio.run(start_client())
+                    except asyncio.CancelledError:
+                        pass
                     except Exception as e:
-                        logger.error(f"LinkSocks client error: {e}")
+                        self._last_connect_error = str(e)
+                        logger.error("LinkSocks client error: %s", e)
+                    finally:
+                        self._client_failed.set()
                         self._client_ready.set()
 
-                try:
-                    asyncio.run(_start())
-                except Exception as e:
-                    logger.error(f"LinkSocks client error: {e}")
-                    self._client_ready.set()
-
-            self._client_thread = threading.Thread(target=run_client, daemon=True)
-            self._client_thread.start()
-
-            if self._client_ready.wait(timeout=timeout):
+                self._client_thread = threading.Thread(target=run_client, daemon=True)
+                self._client_thread.start()
+                if not self._client_ready.wait(timeout=timeout):
+                    raise TimeoutError("LinkSocks connection timed out")
+                if not self.is_connected():
+                    raise CFSolverConnectionError(
+                        getattr(
+                            self, "_last_connect_error", "LinkSocks connection failed"
+                        )
+                    )
                 logger.info("LinkSocks provider established")
-            else:
-                logger.warning(
-                    f"LinkSocks connection timeout after {timeout}s, proceeding anyway"
-                )
+            except BaseException as e:
+                self._stop_client()
+                if not isinstance(e, Exception):
+                    raise
+                logger.error("Connection setup failed: %s", e)
+                self._last_connect_error = str(e)
+                if self.solve and not self.on_challenge:
+                    raise CFSolverConnectionError(
+                        f"Failed to connect to CloudFlyer service: {e}"
+                    ) from e
 
-        except Exception as e:
-            logger.error(f"Connection setup failed: {e}")
-            self._last_connect_error = str(e)
-            if self.solve and not self.on_challenge:
-                raise CFSolverConnectionError(
-                    f"Failed to connect to CloudFlyer service: {e}"
-                )
+    def _stop_client(self):
+        """Cancel on the owning loop and wait for all tunnel cleanup to finish."""
+        self._client_stop.set()
+        loop, task, worker = self._client_loop, self._client_task, self._client_thread
+        if loop and task and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
+        if worker and worker.is_alive():
+            worker.join(timeout=10)
+            if worker.is_alive():
+                raise CFSolverConnectionError("LinkSocks client did not stop")
+        self._client = None
+        self._client_task = None
+        self._client_loop = None
+        self._client_thread = None
+        self._linksocks_config = None
+        self._client_ready.clear()
 
     def is_connected(self) -> bool:
         """Check if LinkSocks client is currently connected.
@@ -339,7 +400,13 @@ class CloudflareSolver:
         Returns:
             True if connected, False otherwise
         """
-        return self._client_thread is not None and self._client_thread.is_alive()
+        return (
+            not self._closed
+            and self._client_thread is not None
+            and self._client_thread.is_alive()
+            and self._client_ready.is_set()
+            and not self._client_failed.is_set()
+        )
 
     def ensure_connected(self, timeout: float = 10.0) -> bool:
         """Ensure LinkSocks connection is established before solving challenges.
@@ -368,11 +435,10 @@ class CloudflareSolver:
     def _detect_challenge(self, resp: Response) -> bool:
         return is_challenge_response(resp, overrides=self.challenge_markers)
 
-    def _get_cache_key(self, url: str) -> str:
-        """Generate cache key from URL host and proxy."""
+    def _get_cache_key(self, url: str) -> tuple:
+        """Bind clearance to its host, egress and client configuration."""
         host = urlparse(url).hostname or ""
-        proxy_key = self.user_proxy or "direct"
-        return f"{host}|{proxy_key}"
+        return (host, self.user_proxy, self.impersonate, self.api_base, self.api_key)
 
     def _load_from_cache(self, url: str) -> bool:
         """Load clearance data from cache if available. Returns True if loaded."""
@@ -380,29 +446,21 @@ class CloudflareSolver:
             return False
 
         cache_key = self._get_cache_key(url)
-        with _clearance_cache_lock:
-            cached = _clearance_cache.get(cache_key)
-            if not cached or not cached.get("cookies"):
-                return False
+        cached = self._clearance_cache.get(cache_key)
+        if not cached or not cached.get("cookies"):
+            return False
 
-            logger.debug(f"Loading clearance from cache for {cache_key}")
+        ja3 = sanitize_ja3(cached.get("ja3"))
+        akamai = cached.get("akamai")
+        self._reset_session(ja3=ja3, akamai=akamai)
 
-            # Apply cached TLS fingerprints
-            ja3 = sanitize_ja3(cached.get("ja3"))
-            akamai = cached.get("akamai")
-            if ja3 or akamai:
-                self._reset_session(ja3=ja3, akamai=akamai)
-
-            # Apply cached cookies and user agent
-            session = self._get_session()
-            domain = urlparse(url).hostname
-            for k, v in cached.get("cookies", {}).items():
-                session.cookies.set(k, v, domain=domain)
-
-            if cached.get("user_agent"):
-                session.headers["User-Agent"] = cached["user_agent"]
-
-            return True
+        session = self._get_session()
+        domain = urlparse(url).hostname
+        for k, v in cached["cookies"].items():
+            session.cookies.set(k, v, domain=domain)
+        if cached.get("user_agent"):
+            session.headers["User-Agent"] = cached["user_agent"]
+        return True
 
     def _save_to_cache(
         self,
@@ -417,19 +475,20 @@ class CloudflareSolver:
             return
 
         cache_key = self._get_cache_key(url)
+        cookies = clearance_cookies(cookies)
         if not cookies:
             # A solve without cookies carries no clearance; caching it would
             # make later requests believe they were already cleared.
-            logger.debug(f"Skipped caching empty clearance for {cache_key}")
             return
-        with _clearance_cache_lock:
-            _clearance_cache[cache_key] = {
+        self._clearance_cache.set(
+            cache_key,
+            {
                 "cookies": cookies,
                 "user_agent": user_agent,
                 "ja3": ja3,
                 "akamai": akamai,
-            }
-            logger.debug(f"Saved clearance to cache for {cache_key}")
+            },
+        )
 
     @staticmethod
     def clear_cache(host: Optional[str] = None):
@@ -438,15 +497,7 @@ class CloudflareSolver:
         Args:
             host: If provided, only clear cache for this host. Otherwise clear all.
         """
-        with _clearance_cache_lock:
-            if host:
-                keys_to_remove = [
-                    k for k in _clearance_cache if k.startswith(f"{host}|")
-                ]
-                for k in keys_to_remove:
-                    del _clearance_cache[k]
-            else:
-                _clearance_cache.clear()
+        ClearanceCache.clear_all(host)
 
     def _solve_challenge(
         self, url: str, html: Optional[str] = None, use_cache: Optional[bool] = None
@@ -505,7 +556,7 @@ class CloudflareSolver:
                     "Challenge solve failed: invalid response from server"
                 )
 
-            cookies = solution.get("cookies", {})
+            cookies = clearance_cookies(solution.get("cookies", {}))
             user_agent = solution.get("userAgent")
             headers = solution.get("headers")
             if not user_agent and isinstance(headers, dict):
@@ -550,42 +601,61 @@ class CloudflareSolver:
             CFSolverChallengeError: If task fails
             CFSolverTimeoutError: If timeout is reached
         """
-        start = time.time()
+        deadline = time.monotonic() + timeout
+        failures = 0
 
         with Session(verify=False, proxy=self.api_proxy) as poll_session:
-            while time.time() - start < timeout:
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 # Choose endpoint based on polling strategy
                 if self.use_polling:
                     endpoint = f"{self.api_base}/api/getTaskResult"
-                    request_timeout = 30
+                    request_timeout = min(remaining, 30)
                 else:
                     endpoint = f"{self.api_base}/api/waitTaskResult"
-                    # Long-polling needs longer timeout (remaining time + buffer)
-                    request_timeout = min(timeout - (time.time() - start) + 10, 310)
+                    request_timeout = min(remaining, 310)
 
-                res = poll_session.post(
-                    endpoint,
-                    json={"apiKey": self.api_key, "taskId": task_id},
-                    timeout=request_timeout,
-                )
+                try:
+                    res = poll_session.post(
+                        endpoint,
+                        json={"apiKey": self.api_key, "taskId": task_id},
+                        timeout=request_timeout,
+                    )
+                except Exception as e:
+                    if time.monotonic() >= deadline:
+                        raise CFSolverTimeoutError("Task timed out") from e
+                    raise
+
+                if time.monotonic() >= deadline:
+                    break
 
                 if res.status_code != 200:
-                    if self.use_polling:
-                        time.sleep(self.polling_interval)
+                    if res.status_code == 429 or 500 <= res.status_code < 600:
+                        failures += 1
+                        time.sleep(
+                            min(
+                                retry_delay(res, failures),
+                                max(0, deadline - time.monotonic()),
+                            )
+                        )
+                    else:
+                        _raise_for_status(res)
+                        raise CFSolverAPIError(
+                            f"Unexpected API status: HTTP {res.status_code}"
+                        )
                     continue
 
+                failures = 0
                 result = res.json()
                 status = result.get("status")
 
                 # Still processing - wait and retry
-                if status == "processing":
-                    if self.use_polling:
-                        time.sleep(self.polling_interval)
+                if status in ("processing", "timeout"):
+                    delay = max(0.1, self.polling_interval) if self.use_polling else 0.1
+                    time.sleep(min(delay, max(0, deadline - time.monotonic())))
                     continue
-
-                # Check for timeout status from waitTaskResult
-                if status == "timeout":
-                    continue  # Retry the long-poll
 
                 # Determine success
                 success_field = result.get("success")
@@ -704,6 +774,31 @@ class CloudflareSolver:
         use_cache: Optional[bool] = None,
         **kwargs,
     ) -> Response:
+        """Send a request with stable session state throughout solving and sending.
+
+        A solver owns one mutable TLS/UA/cookie context. Concurrent callers on
+        the same instance are serialized; independent instances run in parallel.
+        """
+        with self._request_lock:
+            return self._request(
+                method,
+                url,
+                solve=solve,
+                on_challenge=on_challenge,
+                use_cache=use_cache,
+                **kwargs,
+            )
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        solve: Optional[bool] = None,
+        on_challenge: Optional[bool] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ) -> Response:
         """
         Send an HTTP request with optional Cloudflare challenge bypass.
 
@@ -729,11 +824,26 @@ class CloudflareSolver:
 
         def _request_with_fallback() -> Response:
             session = self._get_session()
+            rewind_body = request_body_rewinder(kwargs.get("data"))
             try:
                 return session.request(method, url, **kwargs)
             except Exception as e:
-                if not (self._ja3 or self._akamai):
+                fingerprints = (
+                    self._ja3
+                    or self._akamai
+                    or kwargs.get("ja3")
+                    or kwargs.get("akamai")
+                )
+                if (
+                    not fingerprints
+                    or not is_fingerprint_configuration_error(e)
+                    or rewind_body is None
+                ):
                     raise
+                try:
+                    rewind_body()
+                except (OSError, ValueError):
+                    raise e
 
                 logger.info(
                     "Request failed with TLS fingerprints (%s); retrying with impersonate=%s",
@@ -742,7 +852,12 @@ class CloudflareSolver:
                 )
                 self._reset_session(ja3=None, akamai=None)
                 session = self._get_session()
-                return session.request(method, url, **kwargs)
+                fallback_kwargs = {
+                    key: value
+                    for key, value in kwargs.items()
+                    if key not in ("ja3", "akamai")
+                }
+                return session.request(method, url, **fallback_kwargs)
 
         if not _solve:
             return _request_with_fallback()
@@ -890,16 +1005,22 @@ class CloudflareSolver:
         )
 
     def close(self):
-        if self._session:
+        with self._request_lock, self._connect_lock:
+            self._closed = True
             try:
-                self._session.close()
-            except Exception as e:
-                if is_fingerprint_incompatibility_error(e):
-                    logger.info("Ignoring close() error: %s", str(e))
-                else:
-                    raise
+                if self._session:
+                    try:
+                        self._session.close()
+                    except Exception as e:
+                        if is_fingerprint_incompatibility_error(e):
+                            logger.info("Ignoring close() error: %s", str(e))
+                        else:
+                            raise
+                    finally:
+                        self._session = None
             finally:
-                self._session = None
+                self._stop_client()
+                self._clearance_cache.clear()
         logger.info("Session closed")
 
     def __enter__(self):

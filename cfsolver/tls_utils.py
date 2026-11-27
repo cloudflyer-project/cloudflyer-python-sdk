@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 _CIPHER_NOT_FOUND_RE = re.compile(r"Cipher\s+0x([0-9a-fA-F]+)\s+is\s+not\s+found")
 _EXTENSION_TOGGLE_RE = re.compile(
@@ -39,6 +39,36 @@ def is_extension_toggle_error(error: BaseException) -> bool:
 def is_fingerprint_incompatibility_error(error: BaseException) -> bool:
     """Return True for known non-fatal TLS fingerprint incompatibilities."""
     return is_cipher_not_found_error(error) or is_extension_toggle_error(error)
+
+
+def is_fingerprint_configuration_error(error: BaseException) -> bool:
+    """Recognize failures in curl_cffi's pre-send fingerprint configuration.
+
+    Error text alone cannot establish that a request was not sent. These
+    helpers run in set_curl_options, before perform/add_handle, so a failure
+    originating there is safe to retry even for a non-idempotent method.
+    """
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if frame.f_globals.get("__name__") == "curl_cffi.requests.utils" and (
+            frame.f_code.co_name in {"set_ja3_options", "set_akamai_options"}
+        ):
+            return True
+        traceback = traceback.tb_next
+    return False
+
+
+def request_body_rewinder(data) -> Optional[Callable[[], None]]:
+    """Capture a seekable body's position before curl's option setup reads it."""
+    if not hasattr(data, "read"):
+        return lambda: None
+    try:
+        position = data.tell()
+        data.seek(position)
+    except (AttributeError, OSError, ValueError):
+        return None
+    return lambda: data.seek(position)
 
 
 def extract_missing_cipher_id(error: BaseException) -> Optional[int]:

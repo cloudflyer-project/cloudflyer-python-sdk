@@ -12,6 +12,7 @@ import socket
 import threading
 import time
 import signal
+from collections import OrderedDict
 from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlparse
 
@@ -19,6 +20,7 @@ from mitmproxy import http, options, ctx
 from mitmproxy.tools.dump import DumpMaster
 
 from .async_client import AsyncCloudflareSolver
+from .cookie_utils import find_cookie_value as _find_cookie_value
 from .detection import Detection, detect as detect_challenge
 from .exceptions import CFSolverProxyError
 
@@ -32,38 +34,12 @@ def _is_cleared_response(response: http.Response) -> bool:
     return not detect_challenge(response)
 
 
-def _find_cookie_value(cookies, name: str, url: str) -> Optional[str]:
-    """Read a cookie for the URL's host without domain ambiguity.
+class _SolveFlight:
+    """One in-flight solve; its result outlives cache-disabled/expired entries."""
 
-    Same-named cookies can live on unrelated domains with different values,
-    which makes an unqualified read raise CookieConflict. Prefer an exact
-    host match, then a parent-domain match, and only fall back to a lone
-    candidate when nothing matches the host.
-    """
-    host = (urlparse(url).hostname or "").lower()
-    jar = getattr(cookies, "jar", cookies)
-
-    exact = None
-    parent = None
-    others = []
-    for cookie in jar:
-        if cookie.name != name or not cookie.value:
-            continue
-        domain = (cookie.domain or "").lstrip(".").lower()
-        if domain and host and domain == host:
-            exact = exact or cookie.value
-        elif domain and host and host.endswith("." + domain):
-            parent = parent or cookie.value
-        else:
-            others.append(cookie.value)
-
-    if exact:
-        return exact
-    if parent:
-        return parent
-    if len(others) == 1:
-        return others[0]
-    return None
+    def __init__(self):
+        self.done = asyncio.Event()
+        self.clearance: Optional[Tuple[str, str, Optional[str], Optional[str]]] = None
 
 
 # Header used to exclude a single request from cf_clearance injection and
@@ -174,6 +150,8 @@ class CloudAPIProxyAddon:
 
     # Flow metadata key marking a request that carries the skip header
     _SKIP_CACHE_META = "cfsolver_skip_cache"
+    _MAX_CACHE_HOSTS = 1024
+    _MAX_USER_AGENTS_PER_HOST = 16
 
     def __init__(
         self,
@@ -221,48 +199,53 @@ class CloudAPIProxyAddon:
             else None
         )
 
-        # Host-level locks for serializing challenge solving
-        self.host_locks: Dict[str, asyncio.Event] = {}
+        # Coordination results are independent of the persistent clearance store.
+        self.host_locks: Dict[str, _SolveFlight] = {}
         self.host_lock = asyncio.Lock()
 
         # Store cf_clearance cookies keyed by host and User-Agent
         # Structure: {host: {user_agent: (cf_clearance, stored_at)}}
-        self.cf_clearance_store: Dict[str, Dict[str, Tuple[str, float]]] = {}
+        self.cf_clearance_store: (
+            "OrderedDict[str, OrderedDict[str, Tuple[str, float]]]"
+        ) = OrderedDict()
         # Failed-solve cooldown: {host: monotonic deadline}
-        self.solve_failures: Dict[str, float] = {}
+        self.solve_failures: "OrderedDict[str, float]" = OrderedDict()
         self._store_lock = threading.Lock()
 
-        # Lazy async solver (created on first use inside async response handler)
-        self._solver: Optional[AsyncCloudflareSolver] = None
-
-    def _get_or_create_solver(self) -> AsyncCloudflareSolver:
-        if self._solver is None:
-            self._solver = AsyncCloudflareSolver(
-                api_key=self.api_key,
-                api_base=self.api_base,
-                proxy=self.user_proxy,
-                api_proxy=self.api_proxy,
-                impersonate=self.impersonate,
-                solve=True,
-                on_challenge=True,
-                use_cache=not self.no_cache,
-                polling_interval=self.polling_interval,
-            )
-        return self._solver
+    def _create_solver(self) -> AsyncCloudflareSolver:
+        # A solver owns mutable TLS, UA, cookies and a tunnel. Never share it
+        # between flows; only the proxy's explicit clearance policy is shared.
+        return AsyncCloudflareSolver(
+            api_key=self.api_key,
+            api_base=self.api_base,
+            proxy=self.user_proxy,
+            api_proxy=self.api_proxy,
+            impersonate=self.impersonate,
+            solve=True,
+            on_challenge=True,
+            use_cache=False,
+            polling_interval=self.polling_interval,
+        )
 
     @staticmethod
     def _remove_hop_by_hop_headers(headers: Dict[str, str]) -> None:
-        for h in [
-            "Host",
-            "Connection",
-            "Proxy-Connection",
-            "Keep-Alive",
-            "Transfer-Encoding",
-            "TE",
-            "Trailer",
-            "Upgrade",
-        ]:
-            headers.pop(h, None)
+        excluded = {
+            "connection",
+            "proxy-connection",
+            "keep-alive",
+            "transfer-encoding",
+            "te",
+            "trailer",
+            "upgrade",
+            "proxy-authorization",
+            "proxy-authenticate",
+        }
+        for name, value in headers.items():
+            if name.lower() == "connection":
+                excluded.update(token.strip().lower() for token in value.split(","))
+        for name in list(headers):
+            if name.lower() in excluded:
+                del headers[name]
 
     async def _fetch_via_solver(
         self,
@@ -270,20 +253,37 @@ class CloudAPIProxyAddon:
         url: str,
         *,
         solve: bool,
+        solver: AsyncCloudflareSolver,
         user_agent: Optional[str] = None,
         cf_clearance: Optional[str] = None,
     ) -> Optional[http.Response]:
         """Fetch URL using AsyncCloudflareSolver and return mitmproxy Response."""
         try:
-            solver = self._get_or_create_solver()
+            if solve:
+                # The upstream flow already confirmed a challenge. Solve before
+                # sending the body again, rather than probing with another POST.
+                await solver._solve_challenge(url, use_cache=False)
+                user_agent, cf_clearance = (
+                    await self._try_extract_clearance_from_solver(url, solver)
+                )
 
-            headers = dict(flow.request.headers)
+            headers = {
+                key: value
+                for key, value in flow.request.headers.items()
+                if not self.skip_header or key.lower() != self.skip_header.lower()
+            }
             if user_agent:
+                headers = {
+                    k: v for k, v in headers.items() if k.lower() != "user-agent"
+                }
                 headers["User-Agent"] = user_agent
 
             if cf_clearance:
                 # Ensure cf_clearance is present for this fetch
-                cookie_val = headers.get("Cookie", "")
+                cookie_val = next(
+                    (v for k, v in headers.items() if k.lower() == "cookie"), ""
+                )
+                headers = {k: v for k, v in headers.items() if k.lower() != "cookie"}
                 cookie_parts = [
                     p.strip()
                     for p in cookie_val.split(";")
@@ -293,32 +293,47 @@ class CloudAPIProxyAddon:
                 headers["Cookie"] = "; ".join(cookie_parts)
 
             self._remove_hop_by_hop_headers(headers)
+            headers = {k: v for k, v in headers.items() if k.lower() != "host"}
 
             resp = await solver.request(
                 flow.request.method,
                 url,
                 headers=headers,
-                data=flow.request.content or None,
-                solve=solve,
+                data=flow.request.raw_content or None,
+                allow_redirects=False,
+                solve=False,
                 on_challenge=True,
-                use_cache=not self.no_cache,
+                use_cache=False,
             )
 
-            return http.Response.make(
-                resp.status_code, resp.content, dict(resp.headers)
+            items = (
+                resp.headers.multi_items()
+                if hasattr(resp.headers, "multi_items")
+                else resp.headers.items()
             )
+            response_headers = http.Headers(
+                (
+                    name.encode("utf-8", "surrogateescape"),
+                    value.encode("utf-8", "surrogateescape"),
+                )
+                for name, value in items
+            )
+            self._remove_hop_by_hop_headers(response_headers)
+            if flow.request.method == "HEAD" or resp.status_code in (204, 304):
+                # These headers describe the representation, not the empty wire body.
+                response = http.Response.make(resp.status_code)
+                response.headers = response_headers
+                response.raw_content = b""
+                return response
+            return http.Response.make(resp.status_code, resp.content, response_headers)
         except Exception as e:
             logger.error(f"Failed to fetch {url} via solver: {e}")
             return None
 
     async def _try_extract_clearance_from_solver(
-        self, url: str
+        self, url: str, solver: AsyncCloudflareSolver
     ) -> Tuple[Optional[str], Optional[str]]:
         """Best-effort extract (user_agent, cf_clearance) from solver session state."""
-        solver = self._solver
-        if solver is None:
-            return None, None
-
         user_agent: Optional[str] = None
         cf_clearance: Optional[str] = None
 
@@ -337,6 +352,25 @@ class CloudAPIProxyAddon:
             return None, None
 
         return user_agent, cf_clearance
+
+    async def _resolve_flow(self, flow, url, *, solve, clearance=None):
+        """Fetch in a request-owned solver and return a shareable clearance snapshot."""
+        async with self._create_solver() as solver:
+            kwargs = {}
+            if clearance:
+                user_agent, cf_clearance, ja3, akamai = clearance
+                await solver._reset_session(ja3=ja3, akamai=akamai)
+                kwargs = {"user_agent": user_agent, "cf_clearance": cf_clearance}
+            result = await asyncio.wait_for(
+                self._fetch_via_solver(flow, url, solve=solve, solver=solver, **kwargs),
+                timeout=float(self.timeout),
+            )
+            snapshot = None
+            if result and _is_cleared_response(result):
+                ua, cf = await self._try_extract_clearance_from_solver(url, solver)
+                if ua and cf:
+                    snapshot = (ua, cf, solver._ja3, solver._akamai)
+            return result, snapshot
 
     @staticmethod
     def inject_cookie(flow: http.HTTPFlow, cookie_name: str, cookie_value: str) -> None:
@@ -467,53 +501,38 @@ class CloudAPIProxyAddon:
             else None
         )
         if detection:
-            host = flow.request.host
+            host = flow.request.host.lower()
             skip_cache = bool(flow.metadata.get(self._SKIP_CACHE_META, False))
-            is_solver = False
+            flight = None
+            is_solver = True
 
             # A host whose solve failed recently is passed through untouched
             if self.is_solve_blocked(host):
                 logger.debug(f"[Failure hold] Not solving {flow.request.pretty_url}")
                 return
 
-            # In no_cache mode, every request solves independently (no host-level serialization)
-            if self.no_cache:
-                is_solver = True
-            else:
+            # Skip requests must not consume another flow's injected clearance.
+            # They solve independently, just like no_cache requests.
+            if not self.no_cache and not skip_cache:
                 async with self.host_lock:
-                    if host not in self.host_locks:
-                        self.host_locks[host] = asyncio.Event()
-                        is_solver = True
+                    flight = self.host_locks.get(host)
+                    if flight is None:
+                        flight = self.host_locks[host] = _SolveFlight()
+                    else:
+                        is_solver = False
 
             url = flow.request.pretty_url
             try:
                 if not is_solver:
-                    event = self.host_locks.get(host)
-                    if event:
-                        try:
-                            await asyncio.wait_for(
-                                event.wait(), timeout=float(self.timeout)
-                            )
-                        except asyncio.TimeoutError:
-                            return
-
-                    # After waiting, get stored cf_clearance and re-fetch
-                    if not skip_cache:
-                        stored = self.get_cf_clearance_for_host(host)
-                        if stored:
-                            stored_ua, stored_cf = stored
-                            refetch_result = await self._fetch_via_solver(
-                                flow,
-                                url,
-                                solve=False,
-                                user_agent=stored_ua,
-                                cf_clearance=stored_cf,
-                            )
-                            if refetch_result:
-                                flow.response = refetch_result
-                                logger.debug(
-                                    f"Waiter re-fetched {url} with stored cf_clearance"
-                                )
+                    await asyncio.wait_for(
+                        flight.done.wait(), timeout=float(self.timeout)
+                    )
+                    if flight.clearance:
+                        refetch_result, _ = await self._resolve_flow(
+                            flow, url, solve=False, clearance=flight.clearance
+                        )
+                        if refetch_result:
+                            flow.response = refetch_result
                     return
 
                 # This is the solver thread
@@ -521,7 +540,9 @@ class CloudAPIProxyAddon:
                     f"Detected Cloudflare challenge for {url}, solving via cloud API..."
                 )
 
-                solved_response = await self._fetch_via_solver(flow, url, solve=True)
+                solved_response, clearance = await self._resolve_flow(
+                    flow, url, solve=True
+                )
                 if not solved_response:
                     logger.error(
                         "Challenge solve failed: solver fetch returned no response"
@@ -531,6 +552,9 @@ class CloudAPIProxyAddon:
                     return
 
                 flow.response = solved_response
+
+                if flight and _is_cleared_response(solved_response):
+                    flight.clearance = clearance
 
                 # Persist cf_clearance for future first-send usage when available.
                 # An unusable solve (error status or a page that is still a
@@ -547,15 +571,13 @@ class CloudAPIProxyAddon:
                     )
                     self.record_solve_failure(host)
                     return
-                ua, cf = await self._try_extract_clearance_from_solver(url)
-                if ua and cf:
+                if clearance:
+                    ua, cf, _, _ = clearance
                     self.set_cf_clearance(host, ua, cf)
                     self.clear_solve_failure(host)
                     logger.info(f"[Cache STORE] Stored cf_clearance for {host}")
                 else:
-                    logger.warning(
-                        f"[Cache SKIP] user_agent={bool(ua)}, cf_clearance={bool(cf)}"
-                    )
+                    logger.warning(f"[Cache SKIP] No usable clearance for {host}")
                 return
 
             except Exception as e:
@@ -563,13 +585,11 @@ class CloudAPIProxyAddon:
                 if is_solver and not skip_cache:
                     self.record_solve_failure(host)
             finally:
-                # Only release lock if we acquired one (i.e., not in no_cache mode)
-                # Ensure lock is always released even if exceptions occur before try block
-                if not self.no_cache and is_solver:
-                    async with self.host_lock:
-                        if host in self.host_locks:
-                            self.host_locks[host].set()
-                            del self.host_locks[host]
+                # No await here: cancellation must still release every waiter.
+                if flight and is_solver:
+                    flight.done.set()
+                    if self.host_locks.get(host) is flight:
+                        del self.host_locks[host]
 
     # --- cf_clearance store helpers ---
     def set_cf_clearance(self, host: str, user_agent: str, cf_clearance: str) -> None:
@@ -582,9 +602,15 @@ class CloudAPIProxyAddon:
         with self._store_lock:
             inner = self.cf_clearance_store.get(key_host)
             if inner is None:
-                inner = {}
+                inner = OrderedDict()
                 self.cf_clearance_store[key_host] = inner
             inner[user_agent] = (cf_clearance, time.monotonic())
+            inner.move_to_end(user_agent)
+            self.cf_clearance_store.move_to_end(key_host)
+            while len(inner) > self._MAX_USER_AGENTS_PER_HOST:
+                inner.popitem(last=False)
+            while len(self.cf_clearance_store) > self._MAX_CACHE_HOSTS:
+                self.cf_clearance_store.popitem(last=False)
 
     def _clearance_expired(self, stored_at: float) -> bool:
         if self.success_ttl < 0:
@@ -609,6 +635,8 @@ class CloudAPIProxyAddon:
                 if not inner:
                     self.cf_clearance_store.pop(key_host, None)
                 return None
+            inner.move_to_end(user_agent)
+            self.cf_clearance_store.move_to_end(key_host)
             return cf_clearance
 
     def get_cf_clearance_for_host(self, host: str) -> Optional[tuple]:
@@ -632,6 +660,9 @@ class CloudAPIProxyAddon:
                 inner.pop(ua, None)
             if not inner:
                 self.cf_clearance_store.pop(key_host, None)
+            elif found:
+                inner.move_to_end(found[0])
+                self.cf_clearance_store.move_to_end(key_host)
             return found
 
     # --- failed-solve cooldown helpers ---
@@ -645,7 +676,11 @@ class CloudAPIProxyAddon:
             else time.monotonic() + self.failure_ttl
         )
         with self._store_lock:
-            self.solve_failures[host.lower()] = deadline
+            key_host = host.lower()
+            self.solve_failures[key_host] = deadline
+            self.solve_failures.move_to_end(key_host)
+            while len(self.solve_failures) > self._MAX_CACHE_HOSTS:
+                self.solve_failures.popitem(last=False)
         if self.failure_ttl < 0:
             logger.warning(f"[Solve FAIL] {host}: not solving again this session")
         else:
@@ -665,6 +700,7 @@ class CloudAPIProxyAddon:
             if time.monotonic() >= deadline:
                 self.solve_failures.pop(key_host, None)
                 return False
+            self.solve_failures.move_to_end(key_host)
             return True
 
     def clear_solve_failure(self, host: str) -> None:

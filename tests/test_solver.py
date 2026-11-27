@@ -430,10 +430,8 @@ class TestProxyClearanceCache:
             async def _get_session(self):
                 return session
 
-        addon._solver = FakeSolver()
-
         ua, cf = await addon._try_extract_clearance_from_solver(
-            "https://b.example.com/article"
+            "https://b.example.com/article", FakeSolver()
         )
 
         assert ua == "test-agent"
@@ -454,10 +452,8 @@ class TestProxyClearanceCache:
             async def _get_session(self):
                 return session
 
-        addon._solver = FakeSolver()
-
         _, cf = await addon._try_extract_clearance_from_solver(
-            "https://www.example.com/article"
+            "https://www.example.com/article", FakeSolver()
         )
 
         assert cf == "parent-value"
@@ -714,41 +710,41 @@ class TestSkipHeaderAndCacheRetention:
 class TestBasicRequests:
     """Test basic HTTP requests without challenge solving."""
 
-    def test_simple_get_request(self, mock_solver_kwargs):
+    def test_simple_get_request(self, mock_solver_kwargs, local_http_url):
         """Test simple GET request without solving."""
         with CloudflareSolver(**mock_solver_kwargs, solve=False) as solver:
-            resp = solver.get("https://httpbin.org/get")
+            resp = solver.get(local_http_url + "/get")
             assert resp.status_code == 200
 
-    def test_simple_post_request(self, mock_solver_kwargs):
+    def test_simple_post_request(self, mock_solver_kwargs, local_http_url):
         """Test simple POST request without solving."""
         with CloudflareSolver(**mock_solver_kwargs, solve=False) as solver:
-            resp = solver.post("https://httpbin.org/post", json={"test": "data"})
+            resp = solver.post(local_http_url + "/post", json={"test": "data"})
             assert resp.status_code == 200
             assert "test" in resp.json().get("json", {})
 
-    def test_request_with_headers(self, mock_solver_kwargs):
+    def test_request_with_headers(self, mock_solver_kwargs, local_http_url):
         """Test request with custom headers."""
         with CloudflareSolver(**mock_solver_kwargs, solve=False) as solver:
             resp = solver.get(
-                "https://httpbin.org/headers", headers={"X-Custom-Header": "test-value"}
+                local_http_url + "/headers", headers={"X-Custom-Header": "test-value"}
             )
             assert resp.status_code == 200
             headers = resp.json().get("headers", {})
             assert headers.get("X-Custom-Header") == "test-value"
 
     @pytest.mark.asyncio
-    async def test_async_simple_get_request(self, mock_solver_kwargs):
+    async def test_async_simple_get_request(self, mock_solver_kwargs, local_http_url):
         """Test async GET request without solving."""
         async with AsyncCloudflareSolver(**mock_solver_kwargs, solve=False) as solver:
-            resp = await solver.get("https://httpbin.org/get")
+            resp = await solver.get(local_http_url + "/get")
             assert resp.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_async_simple_post_request(self, mock_solver_kwargs):
+    async def test_async_simple_post_request(self, mock_solver_kwargs, local_http_url):
         """Test async POST request without solving."""
         async with AsyncCloudflareSolver(**mock_solver_kwargs, solve=False) as solver:
-            resp = await solver.post("https://httpbin.org/post", json={"test": "data"})
+            resp = await solver.post(local_http_url + "/post", json={"test": "data"})
             assert resp.status_code == 200
 
 
